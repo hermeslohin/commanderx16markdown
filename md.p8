@@ -325,7 +325,7 @@ main {
     ; keyboard / VERA
     ; ---------------------------------------------------------------
     ; Wait for a key and return it (ISO/ASCII; cursor keys and F-keys use the KERNAL codes).
-    ; The `;@SELFTEST-HOOK` line is replaced by runtest_p8.sh to feed scripted keys.
+    ; The line below marked SELFTEST-HOOK (a comment) is swapped in by runtest_p8.sh to feed scripted keys.
     sub getkey() -> ubyte {
         ubyte k
         ;@SELFTEST-HOOK
