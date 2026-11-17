@@ -4,7 +4,7 @@
 ; switches to a rendered preview with real bold/italic fonts, headings, lists, block
 ; quotes, rules, fenced code and boxed tables; Ctrl-G (or F4) opens a table-of-contents
 ; jump menu. A line containing only [TOC] becomes a contents list in the preview.
-; This is a port of md.c (cc65) to Prog8; the two produce identical screens.
+; (It started life as a C / cc65 program; Prog8 gives smaller, faster code.)
 ;
 ; HOW IT WORKS
 ;   * The document is one flat byte buffer `buf` (ASCII, lines end in $0A) with a table
@@ -44,7 +44,7 @@
 ;     pointers are left in globals instead (eff -> es/en/eq, atx_s -> atx_lvl/atx_off,
 ;     link_at -> lk_rb/lk_rp, list_s -> L_ind/L_mk/L_mlen/L_txt/L_ord).
 ;
-; Build:  make p8      Run:  make runp8   (x16emu)      Try DEMO.MD: Ctrl-O, DEMO.MD, Ctrl-P
+; Build:  make         Run:  make run     (x16emu)      Try DEMO.MD: Ctrl-O, DEMO.MD, Ctrl-P
 
 %import syslib
 %zeropage basicsafe
@@ -325,7 +325,7 @@ main {
     ; keyboard / VERA
     ; ---------------------------------------------------------------
     ; Wait for a key and return it (ISO/ASCII; cursor keys and F-keys use the KERNAL codes).
-    ; The line below marked SELFTEST-HOOK (a comment) is swapped in by runtest_p8.sh to feed scripted keys.
+    ; The line below marked SELFTEST-HOOK (a comment) is swapped in by runtest.sh to feed scripted keys.
     sub getkey() -> ubyte {
         ubyte k
         ;@SELFTEST-HOOK

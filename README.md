@@ -1,11 +1,12 @@
 # MD - Markdown editor for the Commander X16
 
-A modeless Markdown editor written in C (cc65). Write in the editor, press **Ctrl-P** (or **F5**) and the
+A modeless Markdown editor written in [Prog8](https://prog8.readthedocs.io/). Write in the editor, press **Ctrl-P** (or **F5**) and the
 document is shown rendered with fonts, titles, tables and a table of contents. Press it again to go back.
 
 ## Build / run
 
-Needs [cc65](https://cc65.github.io/) and the x16emu emulator (paths at the top of the `Makefile`).
+Needs the [Prog8](https://github.com/irmen/prog8/releases) compiler (`prog8c-12.x-all.jar`, needs Java; put it at
+`~/prog8c.jar` or set `PROG8C`) and the x16emu emulator (paths at the top of the `Makefile`).
 A prebuilt `MD.PRG` is included.
 
     make          # -> MD.PRG
@@ -71,17 +72,10 @@ lines on screen.
 
 ## Self test
 
-`./runtest.sh '<keys>' [rows]` builds a variant that feeds scripted keystrokes (C escapes: `\x10` = Ctrl-P, `\r` =
-Enter), dumps the VERA text screen to `tests/scr.out` and prints it with the bold/italic/box glyphs mapped back to
-plain characters. `FILE=name ./runtest.sh ...` chooses the preloaded file from `tests/` (default `test.md`).
-Beware that C hex escapes are greedy: write `\x02""b` to send Ctrl-B followed by a literal `b`.
+`./runtest.sh '<keys>' [rows]` builds a variant that feeds scripted keystrokes (`\x10` = Ctrl-P, `\r` = Enter), dumps
+the VERA text screen to `tests/scr.out` and prints it with the bold/italic/box glyphs mapped back to plain characters.
+`FILE=name ./runtest.sh ...` chooses the preloaded file from `tests/` (default `test.md`). It uses `~/prog8c.jar`
+unless `PROG8C` is set.
 
     ./runtest.sh '\x10'                      # preview of tests/test.md
     ./runtest.sh '\x8a\x11\x11\r'            # open the TOC menu, go down twice, jump
-
-## Prog8 port
-
-`md.p8` is a Prog8 port of the editor with the same keys, preview, fonts and contents menu (the screen
-output, colours and glyphs match the C build in the self test). Build with `make p8` (needs `~/prog8c.jar`,
-Prog8 12.x, or set `PROG8C`) -> `p8build/md.prg`, or `make runp8`. `./runtest_p8.sh '<keys>' [rows]` is the
-scripted-key test (`FILE=big.md` picks the preloaded file).
