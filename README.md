@@ -57,10 +57,13 @@ lines on screen.
 
 ## Limits
 
-* The document buffer is **8000 bytes / 500 lines** (the editor plus preview renderer use most of the X16's ~38 KB
-  of main RAM). Bigger files are truncated on load and the status line shows the free bytes.
-* The preview is rendered into banked RAM: up to 510 rows; longer documents show `(too long: end cut off)`.
-* One undo level. Tables: up to 8 columns. Headings tracked for the contents: 100.
+* The document is kept in **banked RAM** (a chain of 2 KB pages; only two pages are in main RAM at a time), so
+  on a 2 MB X16 you can edit roughly **1 MB / ~20,000+ lines** (hard limit 60,000 lines). Larger files are truncated
+  on load and the status line shows the free space in KB. Lines longer than 700 characters are split when loading
+  (and cannot be typed longer). Run the emulator with `-ram 2048` (the Makefile does).
+* The preview is rendered into the banks the document is not using (51 rows per bank); if the document is so big
+  that it does not fit, the preview shows `(too long: end cut off)`.
+* One undo level (page-based, so it also covers multi-line edits). Tables: up to 8 columns. Headings tracked for the contents: 100.
 * ASCII only (ISO mode); other bytes show as `?`.
 
 ## Notes

@@ -18,7 +18,7 @@ MD.PRG: md.p8
 # wants it) goes into MD.ARG, which the program reads at start-up; it is removed afterwards.
 run: MD.PRG
 	@if [ -n "$(FILE)" ]; then echo "$(FILE)" | tr 'A-Z' 'a-z' > MD.ARG; fi; \
-	$(X16) -rom $(ROM) -fsroot $(CURDIR) -prg MD.PRG -run; rm -f MD.ARG
+	$(X16) -ram 2048 -rom $(ROM) -fsroot $(CURDIR) -prg MD.PRG -run; rm -f MD.ARG
 
 clean:
 	rm -rf p8build build_test
