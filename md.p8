@@ -1,15 +1,50 @@
 ; MD - a Markdown editor for the Commander X16  (Prog8, target cx16)
 ;
-;  - modeless editor with Markdown syntax colouring and soft line wrap
-;  - Ctrl-P / F5 toggles a rendered preview: headings, bold, italic, code,
-;    links, lists, block quotes, rules, fenced code and boxed tables
-;  - Ctrl-G / F4 opens a table-of-contents jump menu; a line containing
-;    [TOC] expands to a contents list in the preview
-;  - bold / italic faces are synthesised from the ISO charset at start-up
-;    and stored in the unused upper half of VERA's character set
+; A modeless editor with Markdown syntax colouring and soft line wrap. Ctrl-P (or F5)
+; switches to a rendered preview with real bold/italic fonts, headings, lists, block
+; quotes, rules, fenced code and boxed tables; Ctrl-G (or F4) opens a table-of-contents
+; jump menu. A line containing only [TOC] becomes a contents list in the preview.
+; This is a port of md.c (cc65) to Prog8; the two produce identical screens.
 ;
-; Draws straight into VERA text memory (ISO mode, so files are plain ASCII).
-; This is a port of md.c (cc65).
+; HOW IT WORKS
+;   * The document is one flat byte buffer `buf` (ASCII, lines end in $0A) with a table
+;     `lstart` of line start offsets (one extra entry marks the end of the last line).
+;   * Screen output goes straight into VERA's text map in ISO mode ($0F), so a screen
+;     code is plain ASCII. The editor wraps long lines on screen; one logical line may
+;     use several screen rows (see rows_of / draw_logical / cursor_xy).
+;   * FONTS: at start-up build_fonts() reads the 8x8 ISO glyphs from VERA's character set
+;     and writes bold and italic variants (and box-drawing / bullet glyphs) into the
+;     unused upper half of the set (codes 128-159 and 160-254, plus a few low codes).
+;     The preview then just uses those character codes -- bold_glyph()/ital_glyph() map a
+;     letter to its bold/italic code.
+;   * LINE CLASSIFICATION: line_kind() decides what a source line is (blank, fence,
+;     # heading, setext heading, rule, list item, table, [TOC], paragraph). eff() first
+;     strips any leading '>' block-quote markers. The same predicates (atx_s, hr_s,
+;     list_s ...) drive both the editor colouring (hl_md) and the preview renderer.
+;   * PREVIEW: pv_render() walks the document once and turns it into finished screen
+;     rows (80 characters + 80 colours each) which are stored in banked RAM, 51 rows per
+;     8 KB bank in banks 1-10. Text is built word by word (out_glyph / wflush) so words
+;     wrap; tables are measured first so columns can be sized and shrunk to fit. The
+;     viewer (preview_mode) then just copies rows to the screen, so scrolling is instant.
+;   * UNDO: one snapshot of the buffer in banked RAM (banks 20-23), swapped on Ctrl-Z so
+;     pressing it again redoes.
+;
+; CODE MAP (top to bottom)
+;   configuration & state -> helpers -> keyboard & VERA -> fonts -> buffer & lines -> undo
+;   -> character & line classification -> inline markup -> preview renderer -> drawing
+;   helpers & dialogs -> preview viewer -> editor colouring & drawing -> cursor movement
+;   -> file I/O -> editing commands -> key dispatch (edit_key), editor() and start()
+;
+; NOTES FOR READERS NEW TO PROG8
+;   * `iso:"text"` / `iso:'c'` are ASCII literals; plain "text" would be PETSCII. A "\n" in
+;     a Prog8 string is a carriage return (13), which is why insert_str() converts it.
+;   * `@(addr)` reads or writes one byte; `peekw/pokew` do 16-bit words. Arrays are limited
+;     to 256 elements, so big buffers are raw RAM slabs from memory().
+;   * Subroutine variables are static (no recursion). Results that C would return through
+;     pointers are left in globals instead (eff -> es/en/eq, atx_s -> atx_lvl/atx_off,
+;     link_at -> lk_rb/lk_rp, list_s -> L_ind/L_mk/L_mlen/L_txt/L_ord).
+;
+; Build:  make p8      Run:  make runp8   (x16emu)      Try DEMO.MD: Ctrl-O, DEMO.MD, Ctrl-P
 
 %import syslib
 %zeropage basicsafe
@@ -99,6 +134,7 @@ main {
     const ubyte G_X  = 158
     const ubyte G_BUL = 159
 
+    ; Heading colour by level (index 1-6; index 0 is the normal text colour)
     ubyte[7] hcol = [C_NORM, 7, 3, 13, 14, 10, 12]
 
     ; line kinds
@@ -115,6 +151,8 @@ main {
     ; ---------------------------------------------------------------
     ; state
     ; ---------------------------------------------------------------
+    ; Document buffer and line-start table live in raw RAM slabs (see header);
+    ; sizes are BUFSZ+2 and (MAXL+2)*2 so a final newline and end marker always fit.
     uword buf    = memory("buf", 8002, 0)
     uword lstart = memory("lstart", 1004, 0)
 
@@ -186,6 +224,7 @@ main {
     ; ---------------------------------------------------------------
     ; small helpers
     ; ---------------------------------------------------------------
+    ; Length of a NUL-terminated string (max 255).
     sub slen(uword s) -> ubyte {
         ubyte n = 0
         while @(s + n) != 0
@@ -193,6 +232,7 @@ main {
         return n
     }
 
+    ; Copy a NUL-terminated string, at most maxn characters, always NUL-terminating dst.
     sub copystr(uword dst, uword src, ubyte maxn) {
         ubyte n = 0
         while @(src + n) != 0 and n < maxn {
@@ -202,6 +242,7 @@ main {
         @(dst + n) = 0
     }
 
+    ; Append src to the NUL-terminated string dst.
     sub appendstr(uword dst, uword src) {
         ubyte n = slen(dst)
         ubyte i = 0
@@ -213,7 +254,8 @@ main {
         @(dst + n) = 0
     }
 
-    ; append string src to dst at offset d, return new offset
+    ; Append string src to the buffer dst at offset d; returns the new offset.
+    ; (bcat/bnum build the status lines without needing string functions.)
     sub bcat(uword dst, ubyte d, uword src) -> ubyte {
         while @(src) != 0 {
             @(dst + d) = @(src)
@@ -223,7 +265,7 @@ main {
         return d
     }
 
-    ; append decimal number
+    ; Append the decimal number v to the buffer dst at offset d; returns the new offset.
     sub bnum(uword dst, ubyte d, uword v) -> ubyte {
         ubyte[6] tmp
         ubyte t = 0
@@ -242,6 +284,7 @@ main {
         return d
     }
 
+    ; True if n bytes at a and b are identical.
     sub memeq(uword a, uword b, uword n) -> bool {
         uword i = 0
         while i < n {
@@ -252,6 +295,7 @@ main {
         return true
     }
 
+    ; True if character c occurs in the first n bytes at s (like C's memchr).
     sub has_char(uword s, uword n, ubyte c) -> bool {
         uword i = 0
         while i < n {
@@ -262,14 +306,17 @@ main {
         return false
     }
 
+    ; Set the message shown on the bottom line (truncated to 79 characters).
     sub setmsg(uword s) {
         copystr(&msg, s, 79)
     }
 
+    ; Line-start table accessors: ls(i) is the buffer offset where line i begins.
     sub ls(uword i) -> uword {
         return peekw(lstart + (i << 1))
     }
 
+    ; Store a line-start offset (the table is 16-bit values in a raw RAM slab).
     sub setls(uword i, uword v) {
         pokew(lstart + (i << 1), v)
     }
@@ -277,6 +324,8 @@ main {
     ; ---------------------------------------------------------------
     ; keyboard / VERA
     ; ---------------------------------------------------------------
+    ; Wait for a key and return it (ISO/ASCII; cursor keys and F-keys use the KERNAL codes).
+    ; The `;@SELFTEST-HOOK` line is replaced by runtest_p8.sh to feed scripted keys.
     sub getkey() -> ubyte {
         ubyte k
         ;@SELFTEST-HOOK
@@ -288,18 +337,23 @@ main {
         return k
     }
 
+    ; Point VERA data port 0 at text-map cell (x,y) with auto-increment 1, so successive
+    ; writes fill: char, colour, char, colour ... Colour byte = background<<4 | foreground.
     sub vera_at(ubyte x, ubyte y) {
         cx16.VERA_CTRL &= $fe
         cx16.VERA_ADDR = vbase + (y as uword) * vstride + (x as uword) * 2
         cx16.VERA_ADDR_H = $11
     }
 
+    ; Write one character + colour at (x,y).
     sub put_cell(ubyte x, ubyte y, ubyte ch, ubyte col) {
         vera_at(x, y)
         cx16.VERA_DATA0 = ch
         cx16.VERA_DATA0 = col
     }
 
+    ; Read the screen size and find VERA's text map (layer 1): bytes per map row
+    ; (vstride) and the map's base address (vbase). pw is the preview width (max 80).
     sub init_screen() {
         ubyte m
         scrw, scrh = cbm.SCREEN()
@@ -319,6 +373,7 @@ main {
         vbase = ((cx16.VERA_L1_MAPBASE & $7f) as uword) << 9
     }
 
+    ; Fill the whole screen with blanks.
     sub clear_screen() {
         ubyte y = 0
         ubyte x
@@ -341,12 +396,15 @@ main {
     ubyte[8] gg
     ubyte[8] hh
 
+    ; Font helpers: point VERA's data port at the 8-byte glyph for character code c
+    ; (tilebase is where layer 1's character set lives).
     sub gl_addr(ubyte c) {
         cx16.VERA_CTRL &= $fe
         cx16.VERA_ADDR = tilebase + (c as uword) * 8
         cx16.VERA_ADDR_H = $11
     }
 
+    ; Read the 8 bytes of glyph c into gg.
     sub gl_read(ubyte c) {
         ubyte i
         gl_addr(c)
@@ -354,6 +412,7 @@ main {
             gg[i] = cx16.VERA_DATA0
     }
 
+    ; Write the 8 bytes in hh as glyph c.
     sub gl_write(ubyte c) {
         ubyte i
         gl_addr(c)
@@ -361,6 +420,8 @@ main {
             cx16.VERA_DATA0 = hh[i]
     }
 
+    ; Build a box-drawing glyph in character code idx. u/d/l/r say which of the four
+    ; arms (up, down, left, right) it has; the line is 1 pixel wide through the centre.
     sub box_glyph(ubyte idx, ubyte u, ubyte d, ubyte l, ubyte r) {
         ubyte i
         for i in 0 to 7
@@ -380,12 +441,14 @@ main {
         gl_write(idx)
     }
 
+    ; Character code that displays c in bold (printable chars are stored +128).
     sub bold_glyph(ubyte c) -> ubyte {
         if c > 32 and c < 127
             return c + 128
         return c
     }
 
+    ; Character code that displays letter c in italic (A-Z -> 1-26, a-z -> 128-153).
     sub ital_glyph(ubyte c) -> ubyte {
         if c >= iso:'A' and c <= iso:'Z'
             return c - iso:'A' + 1
@@ -394,6 +457,9 @@ main {
         return c
     }
 
+    ; Create the bold and italic faces and the table/bullet glyphs (see header).
+    ; Bold = each row ORed with itself shifted right 1 pixel. Italic = the top half of
+    ; each letter shifted right 1 pixel (a cheap slant).
     sub build_fonts() {
         ubyte c
         ubyte i
@@ -438,10 +504,12 @@ main {
     ; ---------------------------------------------------------------
     ; buffer / lines
     ; ---------------------------------------------------------------
+    ; Number of characters in line l (not counting its newline).
     sub linelen(uword l) -> uword {
         return ls(l + 1) - ls(l) - 1
     }
 
+    ; Binary search: which line contains buffer offset pos?
     sub find_line(uword pos) -> uword {
         uword lo = 0
         uword hi = nlines
@@ -456,6 +524,7 @@ main {
         return lo
     }
 
+    ; Rescan the buffer and rebuild the line-start table (after load / undo).
     sub rebuild_lines() {
         uword i = 0
         nlines = 0
@@ -471,6 +540,7 @@ main {
         }
     }
 
+    ; Reset to an empty document (a single newline).
     sub new_buffer() {
         @(buf) = NL
         blen = 1
@@ -483,6 +553,9 @@ main {
         uvalid = false
     }
 
+    ; Insert n bytes from src at offset pos: shifts the tail up, patches the line-start
+    ; table (adding entries for inserted newlines). Returns false with a message if the
+    ; buffer or the line table would overflow.
     sub buf_insert(uword pos, uword src, uword n) -> bool {
         uword L
         uword k = 0
@@ -535,6 +608,7 @@ main {
         return true
     }
 
+    ; Delete n bytes at pos (the final newline is never removed) and patch the line table.
     sub buf_delete(uword pos, uword n) {
         uword L
         uword k = 0
@@ -568,6 +642,7 @@ main {
         redraw_all = true
     }
 
+    ; Buffer offset of the cursor.
     sub cur_pos() -> uword {
         return ls(cy) + cx
     }
@@ -575,6 +650,9 @@ main {
     ; ---------------------------------------------------------------
     ; undo: one level, kept in banked RAM (swap style)
     ; ---------------------------------------------------------------
+    ; Undo storage: a snapshot is the raw buffer copied into banked RAM at $A000, 8 KB per
+    ; bank. Snapshot set 0 uses banks 20-21 and set 1 uses banks 22-23.
+    ; bank_save copies the current buffer into snapshot `set`.
     sub bank_save(ubyte set) {
         uword off = 0
         uword n
@@ -591,6 +669,7 @@ main {
         cx16.rambank(0)
     }
 
+    ; Copy a saved snapshot (total bytes) back into the buffer.
     sub bank_load(ubyte set, uword total) {
         uword off = 0
         uword n
@@ -607,6 +686,7 @@ main {
         cx16.rambank(0)
     }
 
+    ; Take an undo snapshot of the current state; called before each change.
     sub snap() {
         bank_save(usel)
         smeta_len[usel] = blen
@@ -615,6 +695,8 @@ main {
         uvalid = true
     }
 
+    ; Ctrl-Z: swap the current buffer with the saved snapshot. The current state goes into the
+    ; other slot first, so pressing Ctrl-Z again redoes.
     sub do_undo() {
         ubyte other = usel ^ 1
         if not uvalid {
@@ -643,6 +725,7 @@ main {
     ; ---------------------------------------------------------------
     ; character helpers
     ; ---------------------------------------------------------------
+    ; Character class helpers.
     sub is_digit(ubyte c) -> bool {
         return c >= '0' and c <= '9'
     }
@@ -662,6 +745,7 @@ main {
     ; ---------------------------------------------------------------
     ; markdown line classification
     ; ---------------------------------------------------------------
+    ; True if the n characters at s are all spaces/tabs.
     sub blank_s(uword s, uword n) -> bool {
         while n != 0 {
             if not is_sp(@(s))
@@ -672,7 +756,9 @@ main {
         return true
     }
 
-    ; strip leading '>' block-quote markers of line l  -> es, en, eq
+    ; The 'effective line': line l with leading '>' block-quote markers (up to 4, each
+    ; optionally preceded by up to 3 spaces) removed. Result: es = start, en = length,
+    ; eq = number of quote levels. Everything that classifies a line works on this.
     sub eff(uword l) {
         uword s = buf + ls(l)
         uword n = linelen(l)
@@ -704,6 +790,7 @@ main {
         eq = q
     }
 
+    ; Is this a code-fence line (``` or ~~~, up to 3 spaces of indent)?
     sub fence_s(uword s, uword n) -> bool {
         ubyte sp = 0
         ubyte c
@@ -718,7 +805,8 @@ main {
         return (c == iso:'`' or c == iso:'~') and @(s + 1) == c and @(s + 2) == c
     }
 
-    ; sets atx_lvl, atx_off
+    ; Is this an ATX heading ('#' to '######' followed by a space or end of line)?
+    ; If so sets atx_lvl (1-6) and atx_off (offset of the heading text).
     sub atx_s(uword s, uword n) -> bool {
         uword i = 0
         ubyte k = 0
@@ -739,6 +827,7 @@ main {
         return true
     }
 
+    ; Is this a horizontal rule: three or more of - * _ (optionally spaced) and nothing else?
     sub hr_s(uword s, uword n) -> bool {
         uword i = 0
         uword cnt = 0
@@ -760,6 +849,8 @@ main {
         return cnt >= 3
     }
 
+    ; Is this a list item ('- ', '* ', '+ ', or '1. ' / '1) ')? If so sets L_ind (indent),
+    ; L_mk (marker offset), L_mlen (marker length), L_ord (numbered?) and L_txt (text offset).
     sub list_s(uword s, uword n) -> bool {
         uword i = 0
         uword ind = 0
@@ -798,6 +889,7 @@ main {
         return true
     }
 
+    ; Is this a table separator row (only - | : and spaces, with at least one - and one |)?
     sub sep_s(uword s, uword n) -> bool {
         uword i = 0
         bool dash = false
@@ -816,7 +908,7 @@ main {
         return dash and pipe
     }
 
-    ; sets kind_lvl
+    ; Is this a setext underline (=== or ---) for the line above? Sets kind_lvl (1 or 2).
     sub setext_s(uword s, uword n) -> bool {
         uword i = 0
         uword cnt = 0
@@ -844,6 +936,7 @@ main {
         return true
     }
 
+    ; Is this line exactly [TOC] (any case, surrounding blanks allowed)?
     sub toc_s(uword s, uword n) -> bool {
         while n != 0 and is_sp(@(s + n - 1))
             n--
@@ -855,6 +948,9 @@ main {
                (@(s + 2) | 32) == iso:'o' and (@(s + 3) | 32) == iso:'c'
     }
 
+    ; Classify source line l: one of the LK_* kinds. The order of the tests matters (a '---'
+    ; line is a rule, but under a paragraph line it is a setext underline instead, which is
+    ; why the NEXT line is inspected for tables and setext headings). Sets kind_lvl for headings.
     sub line_kind(uword l) -> ubyte {
         uword s
         uword n
@@ -900,7 +996,7 @@ main {
     uword ht_s
     uword ht_n
 
-    ; heading text of heading i (without #'s) -> ht_s, ht_n
+    ; Heading i's visible text without the leading/trailing #'s -> ht_s, ht_n.
     sub heading_text(ubyte i) {
         uword s
         uword n
@@ -929,6 +1025,8 @@ main {
         ht_n = n
     }
 
+    ; Collect all headings (outside code fences) into hl[] (line), hlv[] (level),
+    ; up to MAXH. Used for the contents menu, the preview's [TOC] and jumping.
     sub scan_headings() {
         uword l = 0
         bool infence = false
@@ -958,7 +1056,9 @@ main {
     ; ---------------------------------------------------------------
     ; inline markup helpers shared by editor colouring and preview
     ; ---------------------------------------------------------------
-    ; may the emphasis marker run at s[i] (width w) open/close?
+    ; May the run of '*' or '_' at s[i] (width w: 1 = italic, 2 = bold) open or close emphasis?
+    ; `on` says whether that style is currently open. A marker must touch text on the inside,
+    ; and '_' inside a word (snake_case) never counts.
     sub emph_ok(uword s, uword n, uword i, ubyte w, bool on) -> bool {
         ubyte c = @(s + i)
         ubyte prev = SP
@@ -972,7 +1072,8 @@ main {
         return prev != SP and not (c == iso:'_' and is_alnum(next))
     }
 
-    ; is there a complete [text](url) starting at s[i]=='['?  sets lk_rb (']') and lk_rp (')')
+    ; Is there a complete [text](url) starting at s[i] == '['?
+    ; If so sets lk_rb (the ']') and lk_rp (the ')').
     sub link_at(uword s, uword n, uword i) -> bool {
         uword j = i + 1
         uword k
@@ -1028,12 +1129,16 @@ main {
     uword lk_end
     uword lk_close
 
+    ; Preview storage: row n lives in bank 1 + n/51 at $A000 + (n%51)*160. This selects that
+    ; bank and returns the row's address (caller must switch back to bank 0 afterwards).
     sub pv_addr(uword n) -> uword {
         ; selects the bank holding preview row n, returns its address in $A000
         cx16.rambank(1 + lsb(n / PV_PER_BANK))
         return $a000 + (n % PV_PER_BANK) * 160
     }
 
+    ; Store the finished row under construction (prch/prco) in banked RAM and count it.
+    ; Sets pv_full when the 510-row limit is reached.
     sub row_flush() {
         uword p
         lastblank = false
@@ -1048,6 +1153,8 @@ main {
         pv_n++
     }
 
+    ; Start a new preview row: blanks, the quote bars for block quotes, the left margin and,
+    ; if a list bullet is pending, the bullet itself.
     sub row_begin() {
         ubyte i
         sys.memset(&prch, SW, SP)
@@ -1072,12 +1179,14 @@ main {
         }
     }
 
+    ; Finish the current row if anything was put on it.
     sub row_end() {
         if rowdirty
             row_flush()
         rowdirty = false
     }
 
+    ; Emit one blank row, but never two in a row.
     sub blank_row() {
         if lastblank
             return
@@ -1086,6 +1195,7 @@ main {
         lastblank = true
     }
 
+    ; Place the pending word (wch/wco) on the row, wrapping to a new row first if it will not fit.
     sub wflush() {
         ubyte i
         if wn == 0
@@ -1109,6 +1219,8 @@ main {
         rowdirty = true
     }
 
+    ; Send one glyph to the preview. Spaces flush the pending word; other characters are collected
+    ; into it. In `sink` mode (table cells) glyphs go to cch/cco instead, to measure or place them.
     sub out_glyph(ubyte g, ubyte col, bool sp) {
         if sink {
             if cn < SW {
@@ -1134,6 +1246,7 @@ main {
         }
     }
 
+    ; Reset the inline-style state (bold, italic, code, strike, link, image) for a new block.
     sub inl_reset() {
         st_b = false
         st_i = false
@@ -1144,6 +1257,8 @@ main {
         prev_sp = true
     }
 
+    ; Emit character c in the current inline style: picks the colour (code, link, image, strike,
+    ; bold, italic, or the block's base colour) and the bold/italic glyph.
     sub put_styled(ubyte c) {
         ubyte g = c
         ubyte col = base_col
@@ -1170,6 +1285,9 @@ main {
         out_glyph(g, col, c == SP)
     }
 
+    ; Render one line of inline Markdown: **bold** __bold__ *italic* _italic_ `code` ~~strike~~
+    ; [links](url) ![images](url) and backslash escapes. Link/image URLs are hidden; the
+    ; text is coloured. Runs of spaces collapse to one (outside code).
     sub inline_emit(uword s, uword n) {
         uword i = 0
         ubyte c
@@ -1253,7 +1371,7 @@ main {
         }
     }
 
-    ; paragraph helper: separate consecutive source lines with a space
+    ; Between two source lines of one paragraph, insert a single space.
     sub inline_join() {
         if not prev_sp {
             put_styled(SP)
@@ -1261,6 +1379,7 @@ main {
         }
     }
 
+    ; Start a block of text at left margin m with base colour col (h = heading: always bold).
     sub begin_text(ubyte m, ubyte col, bool h) {
         margin = m
         base_col = col
@@ -1270,6 +1389,7 @@ main {
         row_begin()
     }
 
+    ; Emit a horizontal rule across the preview in colour col.
     sub rule_row(ubyte col) {
         ubyte x
         row_begin()
@@ -1282,6 +1402,7 @@ main {
         row_flush()
     }
 
+    ; Emit one line of a fenced code block (es/en) on a shaded background, tabs as 4 columns.
     sub code_row() {
         uword i = 0
         ubyte x = margin + 1
@@ -1307,6 +1428,8 @@ main {
         row_flush()
     }
 
+    ; Emit a heading: blank row, the text in the level's colour (bold), and for # and ##
+    ; an underline rule. Records the heading's preview row in hvis[] for jumping.
     sub render_heading(ubyte lvl, uword s, uword n) {
         blank_row()
         if hcur < hn
@@ -1331,6 +1454,8 @@ main {
     ubyte t_nc
     ubyte tx
 
+    ; Split a table row into cells (leading/trailing '|' optional, `\|` is escaped).
+    ; Cell i's text is s[tc_s[i] .. tc_e[i]) with blanks trimmed. Returns the cell count (max 8).
     sub split_row(uword s, uword n) -> ubyte {
         uword i = 0
         uword st
@@ -1361,6 +1486,7 @@ main {
         return c
     }
 
+    ; Render cell c of a row into the sink (cch/cco) so its width cn is known.
     sub cell_measure(uword s, ubyte c, bool header) {
         sink = true
         cn = 0
@@ -1374,6 +1500,7 @@ main {
         sink = false
     }
 
+    ; Put one glyph into the table row being built at column tx.
     sub tbl_put(ubyte g, ubyte col) {
         if tx < pw {
             prch[tx] = g
@@ -1382,6 +1509,7 @@ main {
         }
     }
 
+    ; Emit a table border row using the given left / middle / right box glyphs.
     sub tbl_border(ubyte gl, ubyte gm, ubyte gr) {
         ubyte c
         ubyte k
@@ -1404,6 +1532,8 @@ main {
         row_flush()
     }
 
+    ; Emit one table row: each cell padded to its column width according to its alignment
+    ; (t_al: 0 left, 1 centre, 2 right); text that is too wide is cut with a '~'.
     sub tbl_row(uword s, uword n, bool header) {
         ubyte c
         ubyte shown
@@ -1458,7 +1588,9 @@ main {
         row_flush()
     }
 
-    ; render the table starting at line l; returns first line after it
+    ; Render the table starting at line l (header, separator row, body rows). First reads the
+    ; alignments from the separator row, then measures every cell to get column widths, then
+    ; shrinks the widest columns until the table fits the screen. Returns the first line after it.
     sub render_table(uword l) -> uword {
         uword t
         uword r
@@ -1561,10 +1693,12 @@ main {
         return t
     }
 
+    ; Render a constant string as inline text.
     sub emit_str(uword s) {
         inline_emit(s, slen(s))
     }
 
+    ; Expand a [TOC] marker into a bulleted, indented list of every heading.
     sub render_toc() {
         ubyte i
         ubyte minlv = 7
@@ -1599,6 +1733,9 @@ main {
         blank_row()
     }
 
+    ; Render the whole document into preview rows. Dispatches on line_kind(): blank, fenced code,
+    ; headings (ATX and setext), rules, [TOC], tables, list items and paragraphs. Consecutive
+    ; paragraph lines (in the same quote level) are joined into one wrapped paragraph.
     sub pv_render() {
         uword l = 0
         uword s
@@ -1760,6 +1897,7 @@ main {
     ; ---------------------------------------------------------------
     ; text drawing helpers
     ; ---------------------------------------------------------------
+    ; Draw a NUL-terminated string on a full screen row, padding with spaces.
     sub draw_text(ubyte row, uword s, ubyte col) {
         ubyte x = 0
         vera_at(0, row)
@@ -1774,6 +1912,7 @@ main {
         }
     }
 
+    ; Copy preview row n from banked RAM to screen row y (blank if past the end).
     sub pv_draw_row(ubyte y, uword n) {
         uword p
         ubyte x
@@ -1800,6 +1939,8 @@ main {
     ; ---------------------------------------------------------------
     ; dialogs: line prompt, help, TOC menu
     ; ---------------------------------------------------------------
+    ; Prompt on the bottom line and edit a line of text in `out` (which may hold a default).
+    ; Enter accepts (true), Esc cancels (false); backspace works.
     sub read_line(uword prompt, uword out, ubyte maxn) -> bool {
         ubyte n = slen(out)
         ubyte k
@@ -1838,6 +1979,7 @@ main {
         }
     }
 
+    ; F1: a one-screen key summary.
     sub show_help() {
         clear_screen()
         draw_text(1, iso:"MD - Markdown editor", C_TOC)
@@ -1854,7 +1996,8 @@ main {
         redraw_all = true
     }
 
-    ; returns the chosen heading index, or 255
+    ; The table-of-contents popup: a scrolling list of headings indented by level.
+    ; Up/Down/F6/F7/Home/End move, Enter returns the heading index, Esc returns 255.
     sub toc_menu() -> ubyte {
         ubyte sel = 0
         ubyte first = 0
@@ -1971,6 +2114,9 @@ main {
     ; ---------------------------------------------------------------
     ; preview viewer
     ; ---------------------------------------------------------------
+    ; The preview viewer. Renders the document, starts at the heading nearest above the editing
+    ; cursor, then loops reading keys: scroll, page, next/previous heading, contents menu,
+    ; and Esc / Ctrl-P to return to the editor.
     sub preview_mode() {
         uword pvtop = 0
         uword maxtop
@@ -2071,6 +2217,7 @@ main {
     ; ---------------------------------------------------------------
     ; editor: syntax colouring
     ; ---------------------------------------------------------------
+    ; Give characters fstart..fend-1 of the line being drawn the colour `col` (in cls).
     sub fillc(uword fstart, uword fend, ubyte col) {
         if fend > CLSN
             fend = CLSN
@@ -2080,6 +2227,9 @@ main {
         }
     }
 
+    ; Colour one source line for the editor: fence lines and fenced content, headings, [TOC], rules
+    ; and table separators as a whole; otherwise block-quote bars, list markers, `code`, **bold**,
+    ; *italic*, [text](url) and table pipes.
     sub hl_md(uword s, uword n, bool infence, bool isfence) {
         uword m
         uword i = 0
@@ -2192,6 +2342,7 @@ main {
         }
     }
 
+    ; Is line l inside a fenced code block? (Counts the fences above it.)
     sub fence_before(uword l) -> bool {
         uword i = 0
         bool f = false
@@ -2203,11 +2354,13 @@ main {
         return f
     }
 
+    ; Screen rows used by logical line l when wrapped to the screen width.
     sub rows_of(uword l) -> uword {
         return linelen(l) / scrw + 1
     }
 
-    ; draw logical line l with its first row at screen row `row`; returns rows used
+    ; Draw logical line l starting at screen row `row`, wrapping it over as many rows as it needs.
+    ; f = whether the line starts inside a code fence. Returns the number of rows used.
     sub draw_logical(uword l, ubyte row, bool f) -> ubyte {
         uword s = buf + ls(l)
         uword n = linelen(l)
@@ -2251,6 +2404,7 @@ main {
         return used
     }
 
+    ; Redraw the whole text area from line `top`; `~` marks rows past the end of the file.
     sub draw_screen() {
         uword l = top
         ubyte row = 0
@@ -2277,7 +2431,7 @@ main {
         }
     }
 
-    ; first screen row of logical line l (or 255 if off-screen)
+    ; Screen row where logical line l starts, or 255 if it is not on screen.
     sub line_row(uword l) -> ubyte {
         uword r = 0
         uword i
@@ -2296,6 +2450,7 @@ main {
     ubyte cur_x
     ubyte cur_y
 
+    ; Compute the cursor's screen position (cur_x, cur_y), accounting for wrapped lines above it.
     sub cursor_xy() {
         uword r = 0
         uword i = top
@@ -2313,6 +2468,8 @@ main {
             cur_y = lsb(r)
     }
 
+    ; Two bottom rows: the status line (file, [+] modified, line/column, free bytes) and a message
+    ; or the key hints.
     sub draw_status() {
         ubyte d = 0
         ubyte e
@@ -2350,6 +2507,7 @@ main {
                       (C_BG << 4) | C_LAB)
     }
 
+    ; Scroll (change `top`) so the cursor row is visible.
     sub scroll_to_cursor() {
         if cy < top {
             top = cy
@@ -2364,6 +2522,8 @@ main {
         }
     }
 
+    ; Redraw what changed -- everything if redraw_all, else just the old and new cursor lines --
+    ; then the status and the cursor (shown by inverting its cell).
     sub refresh() {
         ubyte r
         ubyte ch
@@ -2394,16 +2554,19 @@ main {
     ; ---------------------------------------------------------------
     ; cursor movement
     ; ---------------------------------------------------------------
+    ; Remember the cursor's screen column so Up/Down can return to it on shorter lines.
     sub set_want() {
         want = cx % scrw
     }
 
+    ; Keep the cursor within the line.
     sub clamp_cx() {
         uword n = linelen(cy)
         if cx > n
             cx = n
     }
 
+    ; Down one SCREEN row: within a wrapped line first, then to the next line.
     sub move_down() {
         uword n = linelen(cy)
         uword w = scrw
@@ -2418,6 +2581,7 @@ main {
         }
     }
 
+    ; Up one screen row, mirror of move_down.
     sub move_up() {
         uword w = scrw
         uword n
@@ -2435,7 +2599,7 @@ main {
     ; ---------------------------------------------------------------
     ; file i/o
     ; ---------------------------------------------------------------
-    ; CMDR-DOS wants PETSCII style names: a-z -> $41-$5A, A-Z -> $C1-$DA
+    ; CMDR-DOS wants PETSCII file names: convert ASCII in place (a-z -> $41-$5A, A-Z -> $C1-$DA).
     sub dosname(uword d) {
         ubyte c
         while @(d) != 0 {
@@ -2449,6 +2613,7 @@ main {
         }
     }
 
+    ; Read the drive's status line (e.g. "62,file not found,00,00") via channel 15.
     sub dos_status(uword out, ubyte maxn) {
         ubyte n = 0
         ubyte c
@@ -2477,6 +2642,8 @@ main {
         cbm.CLOSE(15)
     }
 
+    ; Load a file (device 8) into the buffer: CR/CRLF become LF, NULs are dropped, a final newline is
+    ; added, and `truncated` is set if it did not fit. Returns false if it could not be read.
     sub load_file(uword name) -> bool {
         uword o = 0
         ubyte c
@@ -2534,6 +2701,7 @@ main {
         return true
     }
 
+    ; Write the buffer to a file, replacing it (`@:`). Reports the drive status unless it is "00".
     sub save_file(uword name) -> bool {
         uword o = 0
 
@@ -2564,6 +2732,7 @@ main {
         return true
     }
 
+    ; Load a file and reset cursor and undo; a missing file starts an empty document.
     sub open_file(uword name) {
         copystr(&fname, name, FNLEN)
         if not load_file(name) {
@@ -2585,6 +2754,7 @@ main {
 
     ubyte[41] sname
 
+    ; Ctrl-W: save, asking for a name first if the document has none.
     sub do_save() {
         if fname[0] == 0 {
             sname[0] = 0
@@ -2599,6 +2769,8 @@ main {
         void save_file(&fname)
     }
 
+    ; Guard for open/quit: with unsaved changes the first press only warns; pressing the same
+    ; key again (warned) discards the changes.
     sub discard_ok() -> bool {
         if not modified or warned {
             warned = false
@@ -2612,6 +2784,8 @@ main {
     ; ---------------------------------------------------------------
     ; editing commands
     ; ---------------------------------------------------------------
+    ; Called before a typing edit: takes ONE undo snapshot at the start of a typing run
+    ; (`typing` stays set until the cursor moves or another command runs).
     sub begin_edit() {
         if not typing {
             snap()
@@ -2619,6 +2793,7 @@ main {
         }
     }
 
+    ; Insert one character at the cursor.
     sub insert_char(ubyte c) {
         begin_edit()
         chbuf[0] = c
@@ -2629,8 +2804,8 @@ main {
 
     ubyte[128] tbuf
 
-    ; insert constant text at the cursor and leave the cursor after it.
-    ; (a "\n" in a Prog8 string is CR, so CR is converted to a newline here)
+    ; Insert constant text at the cursor, leaving the cursor after it. (A "\n" in a Prog8 string is
+    ; CR, so CR is converted to a newline here.)
     sub insert_str(uword t) {
         ubyte n = 0
         ubyte i
@@ -2658,6 +2833,8 @@ main {
 
     ubyte[12] ins
 
+    ; Enter: split the line, keep the indent, and continue '-' '*' '+' '>' list/quote markers;
+    ; Enter on an empty item removes the marker (ends the list).
     sub do_newline() {
         ubyte n = 1
         ubyte i = 0
@@ -2690,6 +2867,7 @@ main {
         set_want()
     }
 
+    ; Delete the character before the cursor (joins lines at column 0).
     sub backspace() {
         begin_edit()
         if cx > 0 {
@@ -2703,6 +2881,7 @@ main {
         set_want()
     }
 
+    ; Ctrl-U: delete the current line.
     sub kill_line() {
         snap()
         typing = false
@@ -2721,6 +2900,8 @@ main {
         set_want()
     }
 
+    ; Insert a marker pair such as **** and put the cursor `back` characters from the end,
+    ; i.e. between the two halves (Ctrl-B bold, Ctrl-E italic, Ctrl-K code).
     sub pair_insert(uword t, ubyte back) {
         snap()
         typing = false
@@ -2729,6 +2910,7 @@ main {
         set_want()
     }
 
+    ; Ctrl-A: insert a 3-column table template and put the cursor in the first header cell.
     sub insert_table() {
         snap()
         typing = false
@@ -2746,6 +2928,7 @@ main {
         setmsg(iso:"Table inserted - edit the cells, Ctrl-P to preview")
     }
 
+    ; Ctrl-R: insert a [TOC] marker on its own line.
     sub insert_toc_marker() {
         snap()
         typing = false
@@ -2761,6 +2944,8 @@ main {
 
     ubyte[32] pat
 
+    ; Ctrl-F: prompt for text and jump to the next match, wrapping; Enter on an empty prompt
+    ; repeats the previous search. Plain text, case-sensitive.
     sub do_find() {
         uword pos
         uword i
@@ -2794,6 +2979,7 @@ main {
         setmsg(iso:"Not found")
     }
 
+    ; Move the cursor to the start of heading i (from the contents menu).
     sub goto_heading(ubyte i) {
         cy = hl[i]
         cx = 0
@@ -2804,6 +2990,10 @@ main {
 
     ubyte[41] oname
 
+    ; Handle one key in the editor. Printable characters are inserted. The first `when` handles
+    ; typing keys (these keep an undo run going); the second handles movement and commands,
+    ; which end the run: arrows, Home/End, paging, preview, contents, save, open, quit, undo,
+    ; kill line, find, markup shortcuts, table and [TOC] inserts, and help.
     sub edit_key(ubyte k) {
         ubyte i
         ubyte t
@@ -2911,6 +3101,7 @@ main {
         }
     }
 
+    ; Main loop: redraw, read a key, clear the message, run the key.
     sub editor() {
         ubyte k
         redraw_all = true
@@ -2924,6 +3115,8 @@ main {
 
     ;@SELFTEST-SUBS
 
+    ; Program entry: set up screen, ISO mode and fonts, run the editor, then restore the standard
+    ; PETSCII character set and console on exit (we modified the font).
     sub start() {
         init_screen()
         cbm.CHROUT($0f)              ; ISO mode
