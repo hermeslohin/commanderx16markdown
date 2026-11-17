@@ -11,8 +11,9 @@ A prebuilt `MD.PRG` is included.
 
     make          # -> MD.PRG
     make run      # starts x16emu with this folder as the SD card
+    make run FILE=DEMO.MD   # ...and opens that file (then Ctrl-P for the preview)
 
-On the X16: `LOAD "MD.PRG"` then `RUN`. Try the included `DEMO.MD`: `Ctrl-O`, type `DEMO.MD`, Enter, then `Ctrl-P`.
+On the X16: `LOAD "MD.PRG"` then `RUN`. Try the included `DEMO.MD`: `make run FILE=DEMO.MD`, or press `Ctrl-O`, type `demo.md` (lower case), Enter, then `Ctrl-P`.
 
 ## Keys
 

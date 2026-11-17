@@ -3113,11 +3113,46 @@ main {
         }
     }
 
-    ;@SELFTEST-SUBS
+        ubyte[41] argbuf
+
+    ; Startup file hand-off used by `make run FILE=name`: if a small file called MD.ARG exists
+    ; on the drive, its first line is a file name to open at start-up. Normally it does not
+    ; exist, and this does nothing. Returns true (name in argbuf) if a name was read.
+    sub startup_arg() -> bool {
+        ubyte n = 0
+        ubyte c
+        ubyte stt
+        cbm.SETNAM(10, "md.arg,s,r")
+        cbm.SETLFS(2, DEVICE, 2)
+        void cbm.OPEN()
+        void cbm.CHKIN(2)
+        repeat {
+            c = cbm.CHRIN()
+            stt = cbm.READST()
+            if stt & $bf != 0
+                break
+            if c == 13 or c == 10
+                break
+            if n < FNLEN {
+                argbuf[n] = c
+                n++
+            }
+            if stt & $40 != 0
+                break
+        }
+        argbuf[n] = 0
+        cbm.CLRCHN()
+        cbm.CLOSE(2)
+        dos_status(&dstat, 40)          ; also clears the drive's error light if the file was missing
+        return n != 0
+    }
+
+;@SELFTEST-SUBS
 
     ; Program entry: set up screen, ISO mode and fonts, run the editor, then restore the standard
     ; PETSCII character set and console on exit (we modified the font).
     sub start() {
+        bool opened
         init_screen()
         cbm.CHROUT($0f)              ; ISO mode
         build_fonts()
@@ -3128,7 +3163,11 @@ main {
         fname[0] = 0
         msg[0] = 0
         ;@SELFTEST-INIT
-        setmsg(iso:"MD for X16 - F1 help, Ctrl-O open, Ctrl-P preview")
+        opened = startup_arg()
+        if opened
+            open_file(&argbuf)
+        if not opened
+            setmsg(iso:"MD for X16 - F1 help, Ctrl-O open, Ctrl-P preview")
         editor()
         cbm.CHROUT($8f)              ; ISO mode off
         cx16.screen_set_charset(3, 0)    ; restore the standard PETSCII charset (we edited glyphs)
