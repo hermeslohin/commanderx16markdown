@@ -7,3 +7,5 @@ tests/CHR.OUT
 p8build/
 build_test/
 MD.ARG
+tests/keys.in
+tests/KEYS.IN

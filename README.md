@@ -57,11 +57,19 @@ lines on screen.
 
 ## Limits
 
-* The document is kept in **banked RAM** (a chain of 2 KB pages; only two pages are in main RAM at a time), so
-  on a 2 MB X16 you can edit roughly **1 MB / ~20,000+ lines** (hard limit 60,000 lines). Larger files are truncated
-  on load and the status line shows the free space in KB. Lines longer than 700 characters are split when loading
-  (and cannot be typed longer). Run the emulator with `-ram 2048` (the Makefile does).
-* The preview is rendered into the banks the document is not using (51 rows per bank); if the document is so big
+* **Large files.** A file is not read into memory when it is opened: it is scanned once and cut into 1 KB pages,
+  and each page is read from the file when you get to it (scrolling, jumping, searching) and cached in banked
+  RAM. Unchanged pages are dropped from the cache whenever room is needed, so a file can be much larger than
+  memory: up to **65,000 lines** or about **3.5 MB** (whichever comes first), even on a 512 KB X16. Files with more lines are truncated on load.
+* **Changed pages stay in memory** until you save. `Free` on the status line is the room left for them (in KB);
+  if it runs out you get `Memory full of changes: save (Ctrl-W) to free it`, and saving makes all of it free
+  again. Since pages are read back from the file while you work, do not change the file behind MD's back.
+* Saving over the file that is open writes `md.tmp` first and then copies it over the file (so the old text can be
+  read until the end); if that copy fails, your text is still in `md.tmp`. Paging needs the X16's SD card / host
+  file system (CMDR-DOS, which can seek in a file).
+* Line endings: CR, LF and CRLF are read (and saved as LF). Lines longer than 700 characters are split when
+  loading (and cannot be typed longer). Run the emulator with `-ram 2048` (the Makefile does) for the biggest cache.
+* The preview is rendered into banked RAM above the changed pages (51 rows per bank); if the document is so big
   that it does not fit, the preview shows `(too long: end cut off)`.
 * One undo level (page-based, so it also covers multi-line edits). Tables: up to 8 columns. Headings tracked for the contents: 100.
 * ASCII only (ISO mode); other bytes show as `?`.
@@ -80,6 +88,8 @@ lines on screen.
 the VERA text screen to `tests/scr.out` and prints it with the bold/italic/box glyphs mapped back to plain characters.
 `FILE=name ./runtest.sh ...` chooses the preloaded file from `tests/` (default `test.md`). It uses `~/prog8c.jar`
 unless `PROG8C` is set.
+The keys (at most 254) are passed in `tests/keys.in`. `RAM=256 ./runtest.sh ...` runs the emulator with less banked
+RAM (default 2048), which makes the page cache small, so large files are really read back from disk as you move.
 
     ./runtest.sh '\x10'                      # preview of tests/test.md
     ./runtest.sh '\x8a\x11\x11\r'            # open the TOC menu, go down twice, jump

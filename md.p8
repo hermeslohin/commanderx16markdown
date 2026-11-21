@@ -7,11 +7,14 @@
 ; (It started life as a C / cc65 program; Prog8 gives smaller, faster code.)
 ;
 ; HOW IT WORKS
-;   * The document lives in BANKED RAM, not in main RAM: a chain of 2 KB pages (runs of whole
-;     lines) with two page-sized windows in main RAM caching the pages in use. Lines are
-;     addressed by number through lp(l) / linelen(l); edits go through splice(). Undo is
-;     copy-on-write on whole pages. See "paged document store" in the code. This allows
-;     ~1 MB / tens of thousands of lines on a 2 MB machine.
+;   * The document is NOT loaded into memory. Opening a file only scans it and cuts it into
+;     1 KB pages (runs of whole lines); a page's text is read from the file when it is first
+;     needed (as you move through the document) and cached in BANKED RAM, and unchanged pages
+;     are dropped from the cache again when room is needed. Only CHANGED pages must stay in
+;     memory (until the next save), so files far larger than memory can be opened. Two
+;     page-sized windows in main RAM hold the pages in use. Lines are addressed by number
+;     through lp(l) / linelen(l); edits go through splice(). Undo is copy-on-write on whole
+;     pages. See "paged document store" in the code.
 ;   * Screen output goes straight into VERA's text map in ISO mode ($0F), so a screen
 ;     code is plain ASCII. The editor wraps long lines on screen; one logical line may
 ;     use several screen rows (see rows_of / draw_logical / cursor_xy).
@@ -26,7 +29,7 @@
 ;     list_s ...) drive both the editor colouring (hl_md) and the preview renderer.
 ;   * PREVIEW: pv_render() walks the document once and turns it into finished screen
 ;     rows (80 characters + 80 colours each) which are stored in banked RAM, 51 rows per
-;     8 KB bank, in the banks above the document's pages. Text is built word by word (out_glyph / wflush) so words
+;     8 KB bank, in the banks above the changed pages (the cache gives way, see pv_setup). Text is built word by word (out_glyph / wflush) so words
 ;     wrap; tables are measured first so columns can be sized and shrunk to fit. The
 ;     viewer (preview_mode) then just copies rows to the screen, so scrolling is instant.
 ;   * UNDO: one level, a copy of the page table; pages are copied only when first edited.
@@ -55,18 +58,31 @@ main {
     ; ---------------------------------------------------------------
     ; configuration
     ; ---------------------------------------------------------------
-    const uword PG    = 2048          ; bytes in one document page (4 pages per 8K bank)
+    const uword PG    = 1024          ; most bytes in one document page (a frame: 8 per 8K bank)
     const uword MAXLN = 700           ; longest line (a page must be able to hold it)
-    const ubyte LPP   = 160           ; most lines in one page
-    const uword PMAX  = 850           ; most physical pages
+    const ubyte LPP   = 128           ; most lines in one page
+    const uword NMAX  = 4096          ; most pages (page numbers 0..NMAX-1)
     const uword NIL   = $ffff
-    const uword MAXLINES = 60000
-    const uword FILL  = 1800          ; the loader starts a new page when one is this full
-    const ubyte TBANK = 1             ; bank 1 holds the page tables
-    const uword TSET  = $09fc         ; size of one table copy: NEXT (uword per page), then NL (ubyte per page)
-    const uword T_NL  = $06a8
-    const uword T_FLAGS = $13f8       ; per physical page: shared with the undo snapshot?
-    const uword T_FREE  = $1750       ; stack of free physical pages
+    const uword MAXLINES = 65000
+    const uword FILL  = 880           ; the loader starts a new page when one is this full
+    ; banks 1-10 hold the page tables (see "paged document store"); each has a table at $a000 and one at $b000
+    const ubyte B_NXL = 1             ; next page, low byte (working / snapshot copy at +0 / +$1000)
+    const ubyte B_NXH = 2             ; next page, high byte
+    const ubyte B_NL  = 3             ; lines in the page (two copies)
+    const ubyte B_FL  = 4             ; $a000: shared with the undo snapshot?  $b000: file offset bits 16-23
+    const ubyte B_FO  = 5             ; file offset where the page starts, bits 0-15
+    const ubyte B_FLN = 6             ; bytes the page takes in the file (NIL: not in the file)
+    const ubyte B_FR  = 7             ; frame holding the page (NIL: none)
+    const ubyte B_BL  = 8             ; bytes in the page
+    const ubyte B_FREE = 9            ; stack of free page numbers
+    const ubyte B_FRM = 10            ; per frame: owner page, state ($a800)
+    const ubyte DOC_BANK0 = 11        ; frames (1 KB each, 8 per bank) start at bank 11
+    const ubyte FR_FREE  = 0          ; frame states
+    const ubyte FR_CLEAN = 1          ;   unchanged copy of the page's bytes in the file
+    const ubyte FR_ONLY  = 2          ;   the page's only copy
+    const ubyte BKLFN = 5             ; logical file / channel the backing file is read on
+    const uword RAWBUF = $b800        ; raw file bytes, read in pieces of RAWLEN: in bank B_FRM,
+    const ubyte RAWLEN = 255          ;   which has room for them at $b800-$bfff
     const ubyte FNLEN = 40
     const ubyte DEVICE = 8
     const ubyte SW    = 80            ; widest text screen
@@ -74,7 +90,6 @@ main {
     const ubyte MAXC  = 8             ; table columns
     const uword CLSN  = 240           ; chars coloured per editor line
     const ubyte PV_PER_BANK = 51      ; preview rows (2*80 bytes) per 8K bank
-    const ubyte DOC_BANK0 = 2         ; document pages start at bank 2 (bank 1 = page tables)
 
     const ubyte NL  = 10
     const ubyte TAB = 9
@@ -162,10 +177,10 @@ main {
     ; state
     ; ---------------------------------------------------------------
     ; The two page windows and their line-start tables are raw RAM slabs (see "paged document store").
-    uword pbuf0 = memory("pbuf0", 2052, 0)
-    uword pbuf1 = memory("pbuf1", 2052, 0)
-    uword pls0  = memory("pls0", 332, 0)
-    uword pls1  = memory("pls1", 332, 0)
+    uword pbuf0 = memory("pbuf0", PG + 4, 0)
+    uword pbuf1 = memory("pbuf1", PG + 4, 0)
+    uword pls0  = $0400               ; (these, cls, msg, rline, iobuf2 and dstat are in "golden RAM",
+    uword pls1  = $0506               ;  $0400-$07ff, because main RAM is full)
 
     uword[2] s_buf            ; slot k: window address
     uword[2] s_ls             ;   line-start table address
@@ -178,16 +193,28 @@ main {
     uword f_li                ;   and line index within it
     ubyte lastused
     uword nbanks              ; RAM banks in this machine
-    ubyte db0                 ; first bank used for document pages
-    uword ndocpg              ; physical pages available
-    uword nfree               ; free physical pages
+    uword nfrm                ; frames in this machine
+    uword frlim               ; frames in use now (the preview borrows the upper ones)
+    uword fhand               ; where getframe() looks for a frame to drop next
+    uword nfree               ; free page numbers
+    uword nhw                 ; page numbers in use are below this
     uword head                ; first page of the working chain
+    ubyte[41] bkname          ; the backing file: unchanged pages are read from it ("" = none)
+    bool bk_isopen
+    long bk_pos               ; where the next read from it starts
+    ubyte cv_prev             ; file-byte converter state (see cv_byte)
+    uword cv_cl
+    bool cv_scan
+    bool cv_wrap
+    uword dec_dst
+    uword dec_o
+    uword dec_max
     uword snap_head
     uword snap_nlines
     uword nlines              ; lines in the document
     ubyte tsel                ; which table copy is the working one
-    uword wbase               ; its offset in bank 1
-    uword sbase               ; offset of the snapshot copy
+    uword wo                  ; its offset in the NEXT / NL banks
+    uword so                  ; offset of the snapshot copy
     uword sm_cx
     uword sm_cy
     uword fc_l
@@ -214,14 +241,14 @@ main {
     bool redraw_all
     uword prev_cy
     ubyte[41] fname
-    ubyte[80] msg
+    &ubyte[80] msg = $0700
     ubyte[32] lastsearch
 
     bool uvalid
 
-    ubyte[240] cls
-    ubyte[52] iobuf2
-    ubyte[40] dstat
+    &ubyte[240] cls = $060c   ; editor colours per character (in golden RAM, see pls0)
+    &ubyte[52] iobuf2 = $07a4
+    &ubyte[40] dstat = $07d8
 
     ; headings
     uword[100] hl            ; source line
@@ -250,7 +277,7 @@ main {
 
     ubyte[84] sline
     ubyte[34] rbuf
-    ubyte[84] rline
+    &ubyte[84] rline = $0750
     ubyte[1] chbuf
 
     ; ---------------------------------------------------------------
@@ -526,92 +553,197 @@ main {
     ; ---------------------------------------------------------------
     ; paged document store
     ; ---------------------------------------------------------------
-    ; The document does NOT live in main RAM. It is a chain of PAGES kept in banked RAM (a page is
-    ; a run of whole lines, at most PG bytes and LPP lines; four pages fit in one 8 KB bank).
-    ; Main RAM only holds two page-sized WINDOWS ("slots") caching the pages being looked at or
-    ; edited. Lines are addressed by line number everywhere:
+    ; The document does NOT live in main RAM. It is a chain of PAGES (a page is a run of whole
+    ; lines, at most PG bytes and LPP lines). Main RAM only holds two page-sized WINDOWS ("slots")
+    ; caching the pages being looked at or edited. Lines are addressed by line number everywhere:
     ;     lp(l)       pointer to the text of line l (valid until another page has to be loaded)
     ;     linelen(l)  its length
-    ; fetch(l) makes the page that holds line l resident (reading it from banked RAM, and writing
-    ; the slot it replaces back first if that was changed). Two slots are enough because the code
-    ; never needs more than two neighbouring lines at once (line_kind looks at l and l+1).
+    ; fetch(l) makes the page that holds line l resident (writing the slot it replaces back first
+    ; if that was changed). Two slots are enough because the code never needs more than two
+    ; neighbouring lines at once (line_kind looks at l and l+1).
     ;
-    ; A page is identified by its physical page number g (a node of a linked list). Bank 1 holds,
-    ; for every g, the next page in document order (NEXT) and its line count (NL), in two copies:
-    ; "working" and "snapshot". Undo is copy-on-write on whole pages: snap() copies the (small)
-    ; arrays and marks every page shared; the first edit to a shared page moves the working
-    ; chain to a fresh copy. Ctrl-Z just swaps which copy is the working one.
+    ; WHERE A PAGE'S TEXT IS. Loading a file does not read it into memory: load_file() only scans
+    ; it once and records, for every page, its line count and where its bytes are in the file
+    ; (the "backing file", bkname). The text is read from the file when a page is first needed
+    ; (pg_read) and kept in a FRAME, a 2 KB slot of banked RAM. A frame is either
+    ;     FR_CLEAN  an unchanged copy of the file's bytes: it can be dropped at any time and read
+    ;               again later, so the cache never fills up while just moving around
+    ;     FR_ONLY   the page was changed (or is new): the frame is its only copy
+    ; So files much larger than memory can be viewed and edited; only CHANGED pages take RAM.
+    ; Saving writes the whole document and then makes the saved file the backing file, which
+    ; turns every frame back into a clean copy (see save_file / rebase).
+    ;
+    ; A page is identified by its number g (a node of a linked list). For every g, banked RAM holds
+    ; the next page in document order (NEXT) and its line count (NL), in two copies: "working"
+    ; and "snapshot". Undo is copy-on-write on whole pages: snap() copies those arrays and marks
+    ; every page shared; the first edit to a shared page moves the working chain to a fresh copy.
+    ; Ctrl-Z just swaps which copy is the working one.
     ;
     ; All edits go through splice() (replace some bytes of a line by other bytes); ed_insert,
     ; del_chars, del_line and join_next are thin wrappers.
 
-    ; --- page tables (bank 1) ---
-    sub tb_get(uword off) -> uword {
-        uword v
-        cx16.rambank(TBANK)
-        v = peekw($a000 + off)
-        cx16.rambank(0)
-        return v
+    ; --- tables in banked RAM. Each bank holds two NMAX-entry byte tables: one at $a000 + g, one at
+    ; $b000 + g. A 16-bit table keeps its low bytes in the first and its high bytes in the second. ---
+    ; (assembly, because these are called from everywhere: arguments come in registers)
+    ; Byte o (0-$1fff) of bank b.
+    asmsub bget(ubyte b @A, uword o @R0) -> ubyte @A {
+        %asm {{
+            sta  $00
+            lda  cx16.r0
+            sta  P8ZP_SCRATCH_W1
+            lda  cx16.r0+1
+            ora  #$a0
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            stz  $00
+            rts
+        }}
     }
 
-    sub tb_set(uword off, uword v) {
-        cx16.rambank(TBANK)
-        pokew($a000 + off, v)
-        cx16.rambank(0)
+    asmsub bset(ubyte b @A, uword o @R0, ubyte v @Y) {
+        %asm {{
+            sta  $00
+            lda  cx16.r0
+            sta  P8ZP_SCRATCH_W1
+            lda  cx16.r0+1
+            ora  #$a0
+            sta  P8ZP_SCRATCH_W1+1
+            tya
+            sta  (P8ZP_SCRATCH_W1)
+            stz  $00
+            rts
+        }}
     }
 
-    sub tb_getb(uword off) -> ubyte {
-        ubyte v
-        cx16.rambank(TBANK)
-        v = @($a000 + off)
-        cx16.rambank(0)
-        return v
+    ; Entry g (0-$fff) of the 16-bit table in bank b.
+    asmsub wget(ubyte b @A, uword g @R0) -> uword @AY {
+        %asm {{
+            sta  $00
+            lda  cx16.r0
+            sta  P8ZP_SCRATCH_W1
+            lda  cx16.r0+1
+            ora  #$a0
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            pha
+            lda  P8ZP_SCRATCH_W1+1
+            ora  #$10
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            tay
+            pla
+            stz  $00
+            rts
+        }}
     }
 
-    sub tb_setb(uword off, ubyte v) {
-        cx16.rambank(TBANK)
-        @($a000 + off) = v
-        cx16.rambank(0)
+    asmsub wset(ubyte b @A, uword g @R0, uword v @R1) {
+        %asm {{
+            sta  $00
+            lda  cx16.r0
+            sta  P8ZP_SCRATCH_W1
+            lda  cx16.r0+1
+            ora  #$a0
+            sta  P8ZP_SCRATCH_W1+1
+            lda  cx16.r1
+            sta  (P8ZP_SCRATCH_W1)
+            lda  P8ZP_SCRATCH_W1+1
+            ora  #$10
+            sta  P8ZP_SCRATCH_W1+1
+            lda  cx16.r1+1
+            sta  (P8ZP_SCRATCH_W1)
+            stz  $00
+            rts
+        }}
     }
 
-    ; Next page after g in the working chain / number of lines in page g.
+    ; NEXT and NL: table copy 0 is at offset 0, copy 1 at $1000 (wo = working, so = snapshot).
+    sub nxo(uword o) -> uword {
+        ubyte h = bget(B_NXH, o)
+        return mkword(h, bget(B_NXL, o))
+    }
+
+    ; Next page after g in the working chain / in the snapshot chain.
     sub nx(uword g) -> uword {
-        return tb_get(wbase + (g << 1))
+        return nxo(g + wo)
+    }
+
+    sub snx(uword g) -> uword {
+        return nxo(g + so)
     }
 
     sub setnx(uword g, uword v) {
-        tb_set(wbase + (g << 1), v)
+        g += wo
+        bset(B_NXL, g, lsb(v))
+        bset(B_NXH, g, msb(v))
     }
 
+    ; Number of lines in page g.
     sub nlc(uword g) -> ubyte {
-        return tb_getb(wbase + T_NL + g)
+        return bget(B_NL, g + wo)
+    }
+
+    sub setnl(uword g, ubyte n) {
+        bset(B_NL, g + wo, n)
     }
 
     ; Choose which of the two table copies is the working one.
     sub set_tsel(ubyte t) {
         tsel = t
-        wbase = (t as uword) * TSET
-        sbase = ((t ^ 1) as uword) * TSET
+        wo = 0
+        so = $1000
+        if t != 0 {
+            wo = $1000
+            so = 0
+        }
     }
 
-    ; Free physical pages are kept on a stack.
+    ; Where page g starts in the backing file (24 bits: two bytes in bank B_FO, one in B_FL).
+    ubyte[4] lbuf
+    sub foff(uword g) -> long {
+        pokew(&lbuf, wget(B_FO, g))
+        lbuf[2] = bget(B_FL, g + $1000)
+        lbuf[3] = 0
+        return peekl(&lbuf)
+    }
+
+    sub set_foff(uword g, long v) {
+        pokel(&lbuf, v)
+        wset(B_FO, g, peekw(&lbuf))
+        bset(B_FL, g + $1000, lbuf[2])
+    }
+
+    ; Free page numbers are kept on a stack. A new page has no frame and nothing in the file.
     sub alloc_pg() -> uword {
+        uword g
         nfree--
-        return tb_get(T_FREE + (nfree << 1))
+        g = wget(B_FREE, nfree)
+        if g >= nhw
+            nhw = g + 1
+        bset(B_FL, g, 0)
+        wset(B_FR, g, NIL)
+        wset(B_FLN, g, NIL)
+        wset(B_BL, g, 0)
+        return g
     }
 
     sub free_pg(uword g) {
-        tb_set(T_FREE + (nfree << 1), g)
+        uword f = wget(B_FR, g)
+        if f != NIL
+            set_fstate(f, FR_FREE)
+        wset(B_FREE, nfree, g)
         nfree++
     }
 
     ; The page before g in the working chain.
     sub pred_of(uword g) -> uword {
         uword p = head
+        uword n
         while p != NIL {
-            if nx(p) == g
+            n = nx(p)
+            if n == g
                 return p
-            p = nx(p)
+            p = n
         }
         return NIL
     }
@@ -620,26 +752,318 @@ main {
     sub relink(uword g, uword g2) {
         uword p = pred_of(g)
         setnx(g2, nx(g))
-        tb_setb(wbase + T_NL + g2, nlc(g))
+        setnl(g2, nlc(g))
         if p == NIL
             head = g2
         else
             setnx(p, g2)
     }
 
-    ; --- physical pages: page g lives in bank db0 + g/4 at offset (g%4)*2048 ---
-    sub pg_read(uword g, uword dst, uword n) {
-        cx16.rambank(db0 + lsb(g >> 2))
-        sys.memcopy($a000 + ((g & 3) << 11), dst, n)
+    ; --- frames: frame f is 1 KB at $a000 + (f%8)*1024 in bank DOC_BANK0 + f/8. Bank B_FRM holds
+    ; each frame's owner page ($a000/$b000 + f) and state ($a800 + f). ---
+    sub fstate(uword f) -> ubyte {
+        return bget(B_FRM, $0800 + f)
+    }
+
+    sub set_fstate(uword f, ubyte s) {
+        bset(B_FRM, $0800 + f, s)
+    }
+
+    ; Select frame f's bank and return its address.
+    sub fr_at(uword f) -> uword {
+        cx16.rambank(DOC_BANK0 + lsb(f >> 3))
+        return $a000 + ((f & 7) << 10)
+    }
+
+    ; Give frame f to page g.
+    sub claim(uword f, uword g, ubyte s) {
+        wset(B_FRM, f, g)
+        set_fstate(f, s)
+        wset(B_FR, g, f)
+    }
+
+    ; A frame for a page: a free one, or else one holding a clean copy, which is simply dropped
+    ; (round robin, so the pages read most recently are dropped last). NIL if every frame holds
+    ; an only copy.
+    sub getframe() -> uword {
+        uword f = 0
+        cx16.rambank(B_FRM)
+        while f < frlim {
+            if @($a800 + f) == FR_FREE {
+                cx16.rambank(0)
+                return f
+            }
+            f++
+        }
+        cx16.rambank(0)
+        repeat frlim {
+            fhand++
+            if fhand >= frlim
+                fhand = 0
+            if fstate(fhand) == FR_CLEAN {
+                wset(B_FR, wget(B_FRM, fhand), NIL)
+                return fhand
+            }
+        }
+        return NIL
+    }
+
+    ; Frames that could take a changed page (free or only a clean copy).
+    sub avail() -> uword {
+        uword f = 0
+        uword n = 0
+        cx16.rambank(B_FRM)
+        while f < frlim {
+            if @($a800 + f) != FR_ONLY
+                n++
+            f++
+        }
+        cx16.rambank(0)
+        return n
+    }
+
+    ; Copy page g into dst (a window): from its frame, or else from the file, keeping a clean copy
+    ; in a frame if one can be had.
+    sub pg_read(uword g, uword dst) {
+        uword f = wget(B_FR, g)
+        if f == NIL {
+            disk_page(g, dst)
+            f = getframe()
+            if f == NIL
+                return
+            claim(f, g, FR_CLEAN)
+            sys.memcopy(dst, fr_at(f), PG)
+        } else
+            sys.memcopy(fr_at(f), dst, PG)
         cx16.rambank(0)
     }
 
+    ; Store n bytes from src as the new text of page g: from now on its frame is its only copy.
     sub pg_write(uword g, uword src, uword n) {
-        if n == 0
-            return
-        cx16.rambank(db0 + lsb(g >> 2))
-        sys.memcopy(src, $a000 + ((g & 3) << 11), n)
+        uword f = wget(B_FR, g)
+        if f == NIL {
+            f = getframe()
+            if f == NIL {
+                setmsg(iso:"Out of memory: a change was lost!")
+                return
+            }
+        }
+        claim(f, g, FR_ONLY)
+        wset(B_FLN, g, NIL)
+        wset(B_BL, g, n)
+        if n != 0
+            sys.memcopy(src, fr_at(f), n)
         cx16.rambank(0)
+    }
+
+    ; --- the backing file: kept open on channel BKLFN while pages are read from it ---
+    sub bk_close() {
+        if bk_isopen {
+            cbm.CLOSE(BKLFN)
+            bk_isopen = false
+        }
+    }
+
+    sub bk_open() {
+        if bk_isopen
+            return
+        copystr(&iobuf2, &bkname, 44)
+        appendstr(&iobuf2, iso:",s,r")
+        dosname(&iobuf2)
+        cbm.SETNAM(slen(&iobuf2), &iobuf2)
+        cbm.SETLFS(BKLFN, DEVICE, BKLFN)
+        void cbm.OPEN()
+        bk_isopen = true
+        bk_pos = 0
+    }
+
+    ; Position the backing file at byte pos (CMDR-DOS "P" command on the command channel). Pages are
+    ; in the file in document order, so moving forward usually reads on where the last read ended:
+    ; then no seek is needed.
+    ubyte[6] pcmd = [$50, BKLFN, 0, 0, 0, 0]
+    sub bk_seek(long pos) {
+        bk_open()
+        if pos == bk_pos
+            return
+        bk_pos = pos
+        pokel(&pcmd + 2, pos)
+        cbm.SETNAM(6, &pcmd)
+        cbm.SETLFS(15, DEVICE, 15)
+        void cbm.OPEN()
+        cbm.CLOSE(15)
+    }
+
+    ; Read up to n bytes of the backing file into dst; returns how many were read. At the end of
+    ; the file (or on an error) the file is closed, because a seek no longer works after that;
+    ; the next bk_seek opens it again. (Reading pages back needs CMDR-DOS, the X16's SD card / host
+    ; file system: it has the "P" command and the MACPTR / MCIOUT block transfers used here.)
+    sub bk_read(uword dst, ubyte n) -> ubyte {
+        uword got = 0
+        bool failed
+        if bk_isopen {
+            void cbm.CHKIN(BKLFN)
+            cx16.rambank(B_FRM)                         ; (for RAWBUF)
+            failed, got = cx16.MACPTR(n, dst, false)   ; fails if the file could not be opened
+            cx16.rambank(0)
+            if failed
+                got = 0
+            bk_pos += got
+            n = cbm.READST()
+            cbm.CLRCHN()
+            if n != 0 or got == 0
+                bk_close()
+        }
+        return lsb(got)
+    }
+
+    ; --- converting file bytes to document bytes: CR and CRLF become LF, NULs are dropped and lines
+    ; longer than MAXLN are broken. The same converter measures the file when it is loaded
+    ; (cv_scan: only counting, see ld_note) and decodes a single page later (writing to dec_dst),
+    ; so a page read back always matches what was counted. A page starts at the file byte that
+    ; produced its first character, with the converter state reset (start of a line). ---
+    sub cv_byte(ubyte c) {
+        ubyte raw = c
+        if c == 13
+            c = NL
+        else if c == NL and cv_prev == 13 {
+            cv_prev = raw
+            return
+        }
+        cv_prev = raw
+        if c == 0
+            return
+        if c != NL and cv_cl >= MAXLN {
+            cv_out(NL)
+            cv_wrap = true
+        }
+        cv_out(c)
+    }
+
+    sub cv_out(ubyte c) {
+        if cv_scan
+            ld_note(c)
+        else if dec_o < dec_max {
+            @(dec_dst + dec_o) = c
+            dec_o++
+        }
+        if c == NL
+            cv_cl = 0
+        else
+            cv_cl++
+    }
+
+    ; Fast path of the converter (assembly; it runs for nearly every byte of a file): handles
+    ; RAWBUF[i..cv_n) for as long as the bytes are plain characters inside a line (not CR, LF or
+    ; NUL, not the first character of a line, not at the line limit MAXLN = 700, and the page is
+    ; not full: FILL = 880 when measuring, dec_max when decoding). Returns where it stopped;
+    ; cv_byte() takes the byte there.
+    asmsub cv_fast(ubyte i @Y) clobbers(A, X) -> ubyte @Y {
+        %asm {{
+            lda  p8b_main.p8v_dec_dst
+            clc
+            adc  p8b_main.p8v_dec_o
+            sta  P8ZP_SCRATCH_W2
+            lda  p8b_main.p8v_dec_dst+1
+            adc  p8b_main.p8v_dec_o+1
+            sta  P8ZP_SCRATCH_W2+1
+            lda  #10                    ; bank B_FRM holds RAWBUF ($b800)
+            sta  $00
+_loop       cpy  p8b_main.p8v_cv_n
+            bcs  _done
+            lda  p8b_main.p8v_cv_cl+1   ; 0 < cv_cl < 700 ?
+            bne  _clhi
+            lda  p8b_main.p8v_cv_cl
+            beq  _done
+            bra  _clok
+_clhi       cmp  #>700
+            bcc  _clok
+            bne  _done
+            lda  p8b_main.p8v_cv_cl
+            cmp  #<700
+            bcs  _done
+_clok       lda  $b800,y
+            cmp  #14
+            bcs  _plain
+            cmp  #13
+            beq  _done
+            cmp  #10
+            beq  _done
+            cmp  #0
+            beq  _done
+_plain      ldx  p8b_main.p8v_cv_scan
+            beq  _dec
+            ldx  p8b_main.p8v_ld_o+1    ; measuring: ld_o < 880 ?
+            cpx  #>880
+            bcc  _cnt
+            bne  _done
+            ldx  p8b_main.p8v_ld_o
+            cpx  #<880
+            bcs  _done
+_cnt        inc  p8b_main.p8v_ld_o
+            bne  _next
+            inc  p8b_main.p8v_ld_o+1
+            bra  _next
+_dec        ldx  p8b_main.p8v_dec_o+1   ; decoding: dec_o < dec_max ?
+            cpx  p8b_main.p8v_dec_max+1
+            bcc  _put
+            bne  _done
+            ldx  p8b_main.p8v_dec_o
+            cpx  p8b_main.p8v_dec_max
+            bcs  _done
+_put        sta  (P8ZP_SCRATCH_W2)
+            inc  P8ZP_SCRATCH_W2
+            bne  _inco
+            inc  P8ZP_SCRATCH_W2+1
+_inco       inc  p8b_main.p8v_dec_o
+            bne  _next
+            inc  p8b_main.p8v_dec_o+1
+_next       sta  p8b_main.p8v_cv_prev
+            inc  p8b_main.p8v_cv_cl
+            bne  _iny
+            inc  p8b_main.p8v_cv_cl+1
+_iny        iny
+            bra  _loop
+_done       stz  $00
+            rts
+        }}
+    }
+
+    ; Read page g from the backing file into dst. If the file no longer matches (changed behind our
+    ; back) the page is padded / cut to its recorded size, so the line bookkeeping stays sane.
+    sub disk_page(uword g, uword dst) {
+        uword left = wget(B_FLN, g)
+        ubyte n
+        ubyte i
+        dec_dst = dst
+        dec_o = 0
+        dec_max = wget(B_BL, g)
+        cv_scan = false
+        cv_cl = 0
+        cv_prev = 0
+        bk_seek(foff(g))
+        while left != 0 {
+            n = RAWLEN
+            if left < RAWLEN
+                n = lsb(left)
+            n = bk_read(RAWBUF, n)
+            if n == 0
+                break
+            left -= n
+            cv_n = n
+            i = 0
+            while i < n {
+                i = cv_fast(i)
+                if i < n {
+                    cv_byte(bget(B_FRM, RAWBUF - $a000 + i))
+                    i++
+                }
+            }
+        }
+        while dec_o < dec_max {
+            @(dst + dec_o) = NL                   ; also adds a missing newline at the end of the file
+            dec_o++
+        }
+        @(dst + dec_max - 1) = NL
     }
 
     ; --- the two resident slots ---
@@ -665,7 +1089,7 @@ main {
         s_bl[k] = i
     }
 
-    ; Write slot k back to its physical page if it was changed.
+    ; Write slot k back to its page if it was changed.
     sub slot_flush(ubyte k) {
         if s_dirty[k] == 0
             return
@@ -692,7 +1116,7 @@ main {
         uword nl
         slot_flush(k)
         nl = nlc(g)
-        pg_read(g, s_buf[k], PG)
+        pg_read(g, s_buf[k])
         s_pg[k] = g
         s_fl[k] = fl
         s_nl[k] = nl
@@ -706,6 +1130,7 @@ main {
         uword g
         uword fl
         uword n
+        uword nn
         for k in 0 to 1 {
             if l - s_fl[k] < s_nl[k] {
                 f_slot = k
@@ -725,10 +1150,13 @@ main {
         }
         repeat {
             n = nlc(g)
-            if l - fl < n or nx(g) == NIL
+            if l - fl < n
+                break
+            nn = nx(g)
+            if nn == NIL
                 break
             fl += n
-            g = nx(g)
+            g = nn
         }
         k = lastused ^ 1
         slot_load(k, g, fl)
@@ -749,43 +1177,51 @@ main {
         return lso(f_slot, f_li + 1) - lso(f_slot, f_li) - 1
     }
 
-    ; Set up the page pool: all physical pages free, no document.
+    ; Set up the page pool: all pages and frames free, no document, no backing file.
     sub pool_reset() {
         uword i
-        ndocpg = (nbanks - db0) * 4
-        if ndocpg > PMAX
-            ndocpg = PMAX
-        cx16.rambank(TBANK)
-        sys.memset($a000 + T_FLAGS, PMAX, 0)
+        bk_close()
+        bkname[0] = 0
+        nfrm = (nbanks - DOC_BANK0) * 8
+        frlim = nfrm
+        cx16.rambank(B_FRM)
+        sys.memset($a800, 2048, FR_FREE)
+        cx16.rambank(B_FREE)
         i = 0
-        while i < ndocpg {
-            pokew($a000 + T_FREE + (i << 1), ndocpg - 1 - i)
+        while i < NMAX {
+            @($a000 + i) = lsb(NMAX - 1 - i)
+            @($b000 + i) = msb(NMAX - 1 - i)
             i++
         }
         cx16.rambank(0)
-        nfree = ndocpg
+        nfree = NMAX
+        nhw = 0
         head = NIL
         nlines = 0
         uvalid = false
         set_tsel(0)
-        slots_drop()
         s_dirty[0] = 0
         s_dirty[1] = 0
+        slots_drop()
         fc_l = 0
         fc_f = false
     }
 
+    ; Make a one-page document from the n bytes (nl lines) in pbuf0.
+    sub single_page(uword n, ubyte nl) {
+        uword g = alloc_pg()
+        pg_write(g, pbuf0, n)
+        setnx(g, NIL)
+        setnl(g, nl)
+        head = g
+        nlines = nl
+    }
+
     ; Reset to an empty document (a single newline).
     sub new_buffer() {
-        uword g
         pool_reset()
         @(pbuf0) = NL
-        g = alloc_pg()
-        pg_write(g, pbuf0, 1)
-        setnx(g, NIL)
-        tb_setb(wbase + T_NL + g, 1)
-        head = g
-        nlines = 1
+        single_page(1, 1)
         cy = 0
         cx = 0
         want = 0
@@ -798,9 +1234,9 @@ main {
     sub mod_begin(ubyte k) {
         uword g = s_pg[k]
         uword g2
-        if tb_getb(T_FLAGS + g) != 0 {
+        if bget(B_FL, g) != 0 {
             g2 = alloc_pg()
-            tb_setb(T_FLAGS + g, 0)
+            bset(B_FL, g, 0)
             relink(g, g2)
             s_pg[k] = g2
         }
@@ -809,7 +1245,7 @@ main {
 
     ; Split the page in slot k (already mod_begin'ed) at line index m. The slot keeps the part that
     ; holds the line being edited (f_li): the upper part if keep_upper, else the lower part; the
-    ; other part goes to its own physical page. f_li is updated.
+    ; other part goes to its own page. f_li is updated.
     sub page_split(ubyte k, uword m, bool keep_upper) {
         uword g = s_pg[k]
         uword nl = s_nl[k]
@@ -818,8 +1254,8 @@ main {
         uword g2 = alloc_pg()
         setnx(g2, nx(g))
         setnx(g, g2)
-        tb_setb(wbase + T_NL + g, lsb(m))
-        tb_setb(wbase + T_NL + g2, lsb(nl - m))
+        setnl(g, lsb(m))
+        setnl(g2, lsb(nl - m))
         if keep_upper {
             pg_write(g, s_buf[k], cut)            ; the lower part stays in page g
             cx16.memory_copy(s_buf[k] + cut, s_buf[k], tail)
@@ -866,10 +1302,12 @@ main {
         }
     }
 
-    ; Can we afford an edit? Every edit may need a couple of fresh pages (copy-on-write, split).
-    sub edit_ok() -> bool {
-        if nfree < 4 {
-            setmsg(iso:"Document full!")
+    ; Can we afford an edit? An insertion may need a few fresh pages and frames (copy-on-write,
+    ; split); a deletion at most one. Frames run out only when that much has been CHANGED; saving
+    ; frees them again. (Deletions need less, so an "insert, then delete" edit cannot stop halfway.)
+    sub edit_ok(ubyte need) -> bool {
+        if nfree < need or avail() < need {
+            setmsg(iso:"Memory full of changes: save (Ctrl-W) to free it")
             return false
         }
         return true
@@ -883,15 +1321,17 @@ main {
         ubyte o
         uword g
         uword pos
-        uword i
         uword add_nl = 0
         uword del_nl = 0
         uword newnl
         uword fk
         uword need
-        if not edit_ok()
+        uword i = 0
+        o = 6
+        if nins == 0
+            o = 2
+        if not edit_ok(o)
             return false
-        i = 0
         while i < nins {
             if @(src + i) == NL
                 add_nl++
@@ -939,7 +1379,7 @@ main {
             s_dirty[k] = 0
         } else {
             s_nl[k] = newnl
-            tb_setb(wbase + T_NL + g, lsb(newnl))
+            setnl(g, lsb(newnl))
             if add_nl == 0 and del_nl == 0 {          ; same lines: just shift the later line starts
                 s_bl[k] += nins - ndel
                 i = f_li + 1
@@ -1016,31 +1456,51 @@ main {
     }
 
     ; ---------------------------------------------------------------
-    ; undo (copy-on-write page tables, see the note at the top of this section)
+    ; undo (copy-on-write page tables, see the note at the top of the store section)
     ; ---------------------------------------------------------------
+    ; Free the pages that only the snapshot uses (not marked shared).
+    sub free_snap_only() {
+        uword g = snap_head
+        uword n
+        while g != NIL {
+            n = snx(g)
+            if bget(B_FL, g) == 0
+                free_pg(g)
+            g = n
+        }
+    }
+
+    ; Forget the undo snapshot.
+    sub drop_undo() {
+        uword g = head
+        if uvalid
+            free_snap_only()
+        while g != NIL {
+            bset(B_FL, g, 0)
+            g = nx(g)
+        }
+        uvalid = false
+    }
+
     ; Take an undo snapshot of the current state; called before each change. Pages that only the
     ; previous snapshot still used are freed; every page of the new snapshot is marked shared.
     sub snap() {
         uword g
         flush_all()
-        cx16.rambank(TBANK)
-        if uvalid {
-            g = snap_head
-            while g != NIL {
-                if @($a000 + T_FLAGS + g) == 0 {
-                    pokew($a000 + T_FREE + (nfree << 1), g)
-                    nfree++
-                }
-                g = peekw($a000 + sbase + (g << 1))
-            }
-        }
-        cx16.memory_copy($a000 + wbase, $a000 + sbase, TSET)
+        if uvalid
+            free_snap_only()
+        cx16.rambank(B_NXL)
+        cx16.memory_copy($a000 + wo, $a000 + so, nhw)
+        cx16.rambank(B_NXH)
+        cx16.memory_copy($a000 + wo, $a000 + so, nhw)
+        cx16.rambank(B_NL)
+        cx16.memory_copy($a000 + wo, $a000 + so, nhw)
+        cx16.rambank(0)
         g = head
         while g != NIL {
-            @($a000 + T_FLAGS + g) = 1
-            g = peekw($a000 + wbase + (g << 1))
+            bset(B_FL, g, 1)
+            g = nx(g)
         }
-        cx16.rambank(0)
         snap_head = head
         snap_nlines = nlines
         sm_cx = cx
@@ -2097,26 +2557,29 @@ main {
     ; paragraph lines (in the same quote level) are joined into one wrapped paragraph.
     ; The preview rows go into whatever banks the document is not using: everything above the
     ; highest page of the working chain and of the undo snapshot.
+    ; The preview rows go in the banks above the frames that hold changed pages. Clean copies are
+    ; dropped first, and until the editor is back (frlim = nfrm) no frame up there is used.
     sub pv_setup() {
-        uword g
-        uword mx = 0
-        cx16.rambank(TBANK)
-        g = head
-        while g != NIL {
-            if g > mx
-                mx = g
-            g = peekw($a000 + wbase + (g << 1))
-        }
-        if uvalid {
-            g = snap_head
-            while g != NIL {
-                if g > mx
-                    mx = g
-                g = peekw($a000 + sbase + (g << 1))
+        uword f = 0
+        uword t = 16                      ; keep at least two banks of frames for reading pages
+        flush_all()
+        while f < nfrm {
+            when fstate(f) {
+                FR_ONLY -> {
+                    if f >= t
+                        t = f + 1
+                }
+                FR_CLEAN -> {
+                    wset(B_FR, wget(B_FRM, f), NIL)
+                    set_fstate(f, FR_FREE)
+                }
             }
+            f++
         }
-        cx16.rambank(0)
-        pv_lo = db0 + lsb(mx >> 2) + 1
+        frlim = (t + 7) & $fff8
+        if frlim > nfrm
+            frlim = nfrm
+        pv_lo = DOC_BANK0 + lsb(frlim >> 3)
         pvmax = (nbanks - pv_lo) * PV_PER_BANK
     }
 
@@ -2592,6 +3055,7 @@ main {
                         pvtop = hvis[t]
                 }
                 K_F5, CTRL_P, K_ESC, iso:'e', iso:'q' -> {
+                    frlim = nfrm
                     redraw_all = true
                     return
                 }
@@ -2895,7 +3359,7 @@ main {
         e = bcat(&rbuf, e, iso:" Col ")
         e = bnum(&rbuf, e, cx + 1)
         e = bcat(&rbuf, e, iso:"  Free ")
-        e = bnum(&rbuf, e, (nfree * 2))
+        e = bnum(&rbuf, e, avail())
         e = bcat(&rbuf, e, iso:"K")
         rbuf[e] = SP
         e++
@@ -3052,157 +3516,248 @@ main {
         cbm.CLOSE(15)
     }
 
-    uword ld_o                ; bytes waiting in the page accumulator (pbuf0)
-    uword ld_lc               ; complete lines among them
-    uword ld_cl               ; length of the line being read
+    ; --- loading: the file is measured, not read into memory (see "paged document store") ---
+    uword ld_o                ; bytes in the page being measured
+    uword ld_lc               ; complete lines in it
     uword ld_tail             ; last page stored so far
+    long ld_rs                ; file offset where the page being measured starts
+    long ld_ls                ; file offset of the first byte of the current line
+    long cv_base              ; file offset of RAWBUF[0]
+    ubyte cv_i                ; index in RAWBUF of the byte being converted
+    ubyte cv_n                ; end of the piece of RAWBUF being converted
 
-    ; Store the first nb bytes (nlns complete lines) of the accumulator as a new page; whatever
-    ; follows (a partly read line) moves to the front.
+    ; Record a page: its first nb bytes (nlns complete lines) of what has been measured, which came
+    ; from file bytes ld_rs up to ld_ls. The partly measured line that follows starts the next page.
     sub ld_commit(uword nb, uword nlns) {
         uword g
-        if nfree <= 8 {
+        long rl = ld_ls - ld_rs
+        if truncated
+            return
+        if nfree <= 16 or nlines + nlns > MAXLINES or rl > 60000 {
             truncated = true
             return
         }
         g = alloc_pg()
-        pg_write(g, pbuf0, nb)
         setnx(g, NIL)
-        tb_setb(wbase + T_NL + g, lsb(nlns))
+        setnl(g, lsb(nlns))
+        wset(B_BL, g, nb)
+        set_foff(g, ld_rs)
+        wset(B_FLN, g, rl as uword)
         if head == NIL
             head = g
         else
             setnx(ld_tail, g)
         ld_tail = g
         nlines += nlns
-        if ld_o > nb
-            cx16.memory_copy(pbuf0 + nb, pbuf0, ld_o - nb)
         ld_o -= nb
         ld_lc -= nlns
+        ld_rs = ld_ls
     }
 
-    ; Append one byte to the accumulator, starting a new page when the current one is full.
-    sub ld_put(ubyte c) {
+    ; Count one converted byte, ending the page first when it is full.
+    sub ld_note(ubyte c) {
+        if cv_cl == 0
+            ld_ls = cv_base + cv_i
         if ld_o >= FILL or ld_lc >= LPP - 2
-            ld_commit(ld_o - ld_cl, ld_lc)
-        if truncated
-            return
-        @(pbuf0 + ld_o) = c
+            ld_commit(ld_o - cv_cl, ld_lc)
         ld_o++
-        if c == NL {
+        if c == NL
             ld_lc++
-            ld_cl = 0
-        } else
-            ld_cl++
     }
 
-    ; Load a file (device 8) into the paged document: CR/CRLF become LF, NULs are dropped, a final
-    ; newline is added, lines longer than MAXLN are broken, and `truncated` is set if it did not fit.
-    ; The file streams straight into pages in banked RAM. Returns false if it could not be read.
+    ; Open a file (device 8) as the document: scan it once to cut it into pages (CR/CRLF become LF,
+    ; NULs are dropped, a final newline is added, lines longer than MAXLN are broken); the text is
+    ; read later, page by page, as it is needed. `truncated` is set if it has more lines (or pages)
+    ; than we can track. Returns false if it could not be read.
     sub load_file(uword name) -> bool {
-        ubyte c
-        ubyte prev = 0
-        ubyte stt
-        bool wrapped = false
-
+        ubyte n
         pool_reset()
-        copystr(&iobuf2, name, 44)
-        appendstr(&iobuf2, iso:",s,r")
-        dosname(&iobuf2)
-        cbm.SETNAM(slen(&iobuf2), &iobuf2)
-        cbm.SETLFS(2, DEVICE, 2)
-        void cbm.OPEN()
+        copystr(&bkname, name, FNLEN)
+        bk_open()
         truncated = false
+        cv_scan = true
+        cv_wrap = false
+        cv_cl = 0
+        cv_prev = 0
+        cv_base = 0
         ld_o = 0
         ld_lc = 0
-        ld_cl = 0
-        void cbm.CHKIN(2)
+        ld_rs = 0
         repeat {
-            c = cbm.CHRIN()
-            stt = cbm.READST()
-            if stt & $bf != 0
+            n = bk_read(RAWBUF, RAWLEN)
+            if n == 0
                 break
-            if c == 13 {
-                c = NL
-            } else if c == NL and prev == 13 {
-                prev = c
-                if stt & $40 != 0
-                    break
-                continue
-            }
-            prev = c
-            if c != 0 {
-                if c != NL and ld_cl >= MAXLN {
-                    ld_put(NL)
-                    wrapped = true
+            cv_n = n
+            cv_i = 0
+            while cv_i < n {
+                cv_i = cv_fast(cv_i)
+                if cv_i < n {
+                    cv_byte(bget(B_FRM, RAWBUF - $a000 + cv_i))
+                    cv_i++
                 }
-                ld_put(c)
-                if truncated
-                    break
             }
-            if stt & $40 != 0
+            cv_base += n
+            if truncated
                 break
         }
-        cbm.CLRCHN()
-        cbm.CLOSE(2)
+        bk_close()
         dos_status(&dstat, 40)
         if dstat[0] == iso:'6' or dstat[0] == iso:'7' or (dstat[0] == iso:'5' and dstat[1] != iso:'0') {
             if ld_o == 0 and nlines == 0 {
+                bkname[0] = 0
                 setmsg(&dstat)
                 return false
             }
         }
-        if not truncated {
-            if ld_o == 0 or @(pbuf0 + ld_o - 1) != NL
-                ld_put(NL)
-        }
-        if ld_o > 0 and not truncated
+        if ld_o != 0 and not truncated {
+            ld_ls = cv_base
+            if cv_cl != 0 {                       ; no newline at the end: the page gets one
+                ld_o++
+                ld_lc++
+            }
             ld_commit(ld_o, ld_lc)
+        }
         if nlines == 0 {
             @(pbuf0) = NL
-            ld_o = 1
-            ld_lc = 1
-            truncated = false
-            ld_commit(1, 1)
+            single_page(1, 1)
         }
-        if wrapped
+        if cv_wrap
             setmsg(iso:"Very long lines were split")
         return true
     }
 
-    ; Write the document to a file, replacing it (`@:`). Reports the drive status unless it is "00".
-    sub save_file(uword name) -> bool {
-        uword p
-        uword o
-        uword n
+    ; --- saving ---
+    ; Send a DOS command (ASCII, e.g. "s:md.tmp") on the command channel.
+    sub dos_cmd(uword c) {
+        copystr(&iobuf2, c, 50)
+        dosname(&iobuf2)
+        cbm.SETNAM(slen(&iobuf2), &iobuf2)
+        cbm.SETLFS(15, DEVICE, 15)
+        void cbm.OPEN()
+        cbm.CLOSE(15)
+    }
 
+    ; Open file `name` for writing on channel 2, replacing it.
+    sub wr_open(uword name) {
         copystr(&iobuf2, iso:"@:", 4)
         appendstr(&iobuf2, name)
         appendstr(&iobuf2, iso:",s,w")
         dosname(&iobuf2)
-        flush_all()
         cbm.SETNAM(slen(&iobuf2), &iobuf2)
         cbm.SETLFS(2, DEVICE, 2)
         void cbm.OPEN()
+    }
+
+    ; Write n bytes at src to channel 2 (in blocks, with MCIOUT).
+    sub wr_bytes(uword src, uword n) {
         cbm.CHKOUT(2)
-        p = head
-        while p != NIL {
-            slot_load(0, p, 0)
-            o = 0
-            n = s_bl[0]
-            while o < n {
-                cbm.CHROUT(@(pbuf0 + o))
-                o++
-            }
-            p = nx(p)
+        while n != 0 {
+            uword done = 255
+            if n < 255
+                done = n
+            void, done = cx16.MCIOUT(lsb(done), src, false)
+            if done == 0
+                break
+            src += done
+            n -= done
         }
-        slots_drop()                      ; slot 0 was borrowed with made-up line numbers
         cbm.CLRCHN()
+    }
+
+    ; Close channel 2; true if the drive reports "00" (else the status becomes the message).
+    sub wr_close() -> bool {
         cbm.CLOSE(2)
         dos_status(&dstat, 40)
         if dstat[0] != iso:'0' or dstat[1] != iso:'0' {
             setmsg(&dstat)
             return false
+        }
+        return true
+    }
+
+    ; Before the backing file changes: pages that only the undo snapshot still uses and that are
+    ; read from the file are kept in memory instead (if memory is short, undo is dropped).
+    sub pin_snap() {
+        uword g = snap_head
+        uword f
+        if not uvalid
+            return
+        slots_drop()
+        while g != NIL {
+            if bget(B_FL, g) == 0 and wget(B_FLN, g) != NIL {
+                if wget(B_FR, g) == NIL
+                    pg_read(g, pbuf0)
+                f = wget(B_FR, g)
+                if f == NIL {
+                    drop_undo()
+                    return
+                }
+                set_fstate(f, FR_ONLY)
+                wset(B_FLN, g, NIL)
+            }
+            g = snx(g)
+        }
+    }
+
+    ; The file `name` now holds exactly the document: read pages from it from now on. Every page
+    ; in memory becomes a clean copy (so saving frees the memory that changes were using).
+    sub rebase(uword name) {
+        long pos = 0
+        uword g = head
+        pin_snap()
+        bk_close()
+        copystr(&bkname, name, FNLEN)
+        while g != NIL {
+            uword n = wget(B_BL, g)
+            set_foff(g, pos)
+            wset(B_FLN, g, n)
+            pos += n
+            n = wget(B_FR, g)
+            if n != NIL
+                set_fstate(n, FR_CLEAN)
+            g = nx(g)
+        }
+    }
+
+    ; Write the document to a file, replacing it. Pages that were never loaded are read from the
+    ; backing file on the way. When saving over the backing file itself, the document goes to
+    ; md.tmp first and is then copied over the old file (which is being read until then).
+    sub save_file(uword name) -> bool {
+        uword p
+        ubyte n
+        bool same = bkname[0] != 0 and slen(name) == slen(&bkname) and memeq(name, &bkname, slen(name))
+        uword target = name
+        if same
+            target = iso:"md.tmp"
+        flush_all()
+        wr_open(target)
+        p = head
+        while p != NIL {
+            slot_load(0, p, 0)
+            wr_bytes(pbuf0, s_bl[0])
+            p = nx(p)
+        }
+        slots_drop()                      ; slot 0 was borrowed with made-up line numbers
+        if not wr_close()
+            return false
+        rebase(target)
+        if same {
+            ; copy md.tmp over the old file (bk_read closes md.tmp at its end)
+            wr_open(name)
+            bk_open()
+            repeat {
+                n = bk_read(pbuf0, RAWLEN)
+                if n == 0
+                    break
+                wr_bytes(pbuf0, n)
+            }
+            bk_close()
+            if not wr_close() {
+                setmsg(iso:"Save failed! The text is safe in md.tmp")
+                return false
+            }
+            copystr(&bkname, name, FNLEN)
+            dos_cmd(iso:"s:md.tmp")
         }
         modified = false
         copystr(&sline, iso:"\"", 1)
@@ -3655,6 +4210,7 @@ main {
     ; PETSCII character set and console on exit (we modified the font).
     sub start() {
         bool opened
+        sys.memset($0400, $0400, 0)      ; golden RAM holds buffers too (see pls): start them empty
         init_screen()
         cbm.CHROUT($0f)              ; ISO mode
         build_fonts()
@@ -3662,7 +4218,6 @@ main {
         cx16.VERA_CTRL &= $fe
         cx16.VERA_DC_BORDER = 0
         nbanks = cx16.numbanks()
-        db0 = DOC_BANK0
         s_buf[0] = pbuf0
         s_buf[1] = pbuf1
         s_ls[0] = pls0
